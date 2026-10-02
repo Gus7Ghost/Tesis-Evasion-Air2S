@@ -1,0 +1,28 @@
+# config.yaml
+# Configuración global del sistema de evasión (Air 2S + RosettaDrone)
+
+network:
+  # Puerto por defecto donde RosettaDrone emite la telemetría MAVLink vía UDP
+  mavsdk_connection: "udp://:19980" 
+  # Dirección RTSP del video del dron. (Debes cambiar la IP por la de tu Tablet)
+  video_stream_uri: "rtsp://192.168.43.54:8554/fpv" 
+
+perception:
+  # MiDaS es excelente para estimación monocular de profundidad en entornos urbanos
+  model_type: "midas_v21_small"
+  model_path: "models/midas_v21_small_256.tflite"
+  input_width: 256
+  input_height: 256
+  # Factor de escala (aprox) para mapear disparidad a metros
+  max_depth_meters: 10.0 
+
+vfh_plus:
+  sector_resolution_deg: 5      # Resolución angular del histograma (en grados)
+  safety_radius_m: 1.5          # Radio de seguridad (distancia mínima al obstáculo)
+  threshold_high: 0.8           # Umbral de densidad para considerar un sector BLOQUEADO
+  threshold_low: 0.4            # Umbral de densidad para considerar un sector LIBRE
+  max_speed_ms: 2.0             # Velocidad máxima de evasión (metros por segundo)
+
+logging:
+  csv_path: "logs/metrics_log.csv"
+  enable_profiler: true

@@ -1,0 +1,23 @@
+# Entornos Virtuales
+venv/
+env/
+.env
+
+# Archivos compilados de Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Modelos de IA (Son muy pesados para GitHub)
+models/
+*.tflite
+*.caffemodel
+*.prototxt
+*.pt
+
+# Logs de métricas
+logs/
+*.csv
+
+# Configuración local (Opcional, pero se suele ignorar si tiene IPs privadas)
+# config.yaml

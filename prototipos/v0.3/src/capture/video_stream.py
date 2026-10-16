@@ -1,13 +1,13 @@
 import os
 import ctypes
 
-# Inyectar variables de ultra baja latencia en el C-Runtime de Windows (msvcrt) para FFMPEG
+# Inyectar buffer grande (2MB) en Windows msvcrt para evitar descarte de paquetes en Wi-Fi
 opt = (
     "OPENCV_FFMPEG_CAPTURE_OPTIONS=protocol_whitelist;file,rtp,udp|"
-    "fflags;nobuffer|flags;low_delay|probesize;32|analyzeduration;0|max_delay;0"
+    "fflags;nobuffer|flags;low_delay|buffer_size;2097152|max_delay;500000"
 )
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-    "protocol_whitelist;file,rtp,udp|fflags;nobuffer|flags;low_delay|probesize;32|analyzeduration;0|max_delay;0"
+    "protocol_whitelist;file,rtp,udp|fflags;nobuffer|flags;low_delay|buffer_size;2097152|max_delay;500000"
 )
 try:
     ctypes.cdll.msvcrt._putenv(opt.encode("ascii"))
@@ -30,11 +30,10 @@ class VideoStream:
         self.running = True
         self.lock = threading.Lock()
         
-        # Iniciamos el hilo que leerá y vaciará los frames constantemente
         self.thread = threading.Thread(target=self._update, daemon=True)
         self.thread.start()
         
-        print(f"[VideoStream] Vinculado a {self.uri} (UDP 5600 - Ultra Baja Latencia)...")
+        print(f"[VideoStream] Vinculado a {self.uri} (UDP 5600 - Buffer 2MB)...")
 
     def _update(self):
         """Bucle infinito en segundo plano para limpiar el buffer."""

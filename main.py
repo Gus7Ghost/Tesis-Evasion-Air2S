@@ -68,6 +68,9 @@ async def main():
         
         await controller.start_offboard()
 
+        last_state_was_evasion = False
+        current_state = "INICIALIZANDO"
+
         while True:
             profiler.start_frame()
 
@@ -96,8 +99,9 @@ async def main():
             profiler.start_step("depth")
             depth_map = depth_estimator.estimate(frame)
             angles, polar_histogram = obstacle_detector.to_polar_histogram(depth_map)
+            min_dist = obstacle_detector.get_min_distance()
 
-            # --- PASO 3: Planificación (Fusión Matemática) ---
+            # --- PASO 3: Planificación (Fusión Matemática VFH+) ---
             profiler.start_step("planning")
             # VFH+ intentará ir hacia person_angle. Si hay un obstáculo, lo rodeará.
             escape_angle, escape_speed = planner.calculate_escape(
@@ -110,6 +114,27 @@ async def main():
             # Ajustar velocidad: Si perdimos a la persona, no avanzamos.
             if target_speed == 0.0:
                 escape_speed = 0.0
+
+            # --- MÁQUINA DE ESTADOS FINITOS (FSM) PARA LA TESIS ---
+            # Demuestra formalmente: SEGUIMIENTO -> EVASIÓN -> REANUDACIÓN
+            safety_radius = config.get("vfh_plus", {}).get("safety_radius_m", 1.5)
+            is_diverging = abs(escape_angle - person_angle) > 8.0
+
+            if person_box is None:
+                current_state = "BUSQUEDA"
+                state_color = (180, 180, 180) # Gris
+            elif is_diverging or min_dist < safety_radius:
+                current_state = "EVASION"
+                state_color = (0, 0, 255) # Rojo (Esquivando obstáculo)
+                last_state_was_evasion = True
+            elif last_state_was_evasion:
+                current_state = "REANUDANDO"
+                state_color = (0, 255, 255) # Amarillo (Volviendo al objetivo)
+                if abs(escape_angle - person_angle) <= 3.0:
+                    last_state_was_evasion = False
+            else:
+                current_state = "SEGUIMIENTO"
+                state_color = (0, 255, 0) # Verde (Seguimiento nominal)
 
             # --- PASO 4: Ejecución ---
             profiler.start_step("execution")
@@ -127,9 +152,11 @@ async def main():
             
             logger.log(
                 timestamp=time.time(),
+                estado_fsm=current_state,
                 latency_ms=profiler.get_total_latency(),
                 fps=profiler.get_fps(),
-                min_distance=obstacle_detector.get_min_distance(),
+                min_distance=min_dist,
+                target_angle=person_angle,
                 evasion_angle=escape_angle,
                 telemetry=drone_state
             )
@@ -161,12 +188,16 @@ async def main():
             combined_view = np.hstack((vis_frame, depth_color_resized))
             
             # 3. Textos HUD (Head-Up Display)
-            cv2.putText(combined_view, f"FPS: {profiler.get_fps():.1f}", (15, 35), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-            cv2.putText(combined_view, f"Target Angle: {person_angle:.1f}", (15, 75), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-            cv2.putText(combined_view, f"Evasion Angle: {escape_angle:.1f}", (15, 115), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255) if abs(escape_angle - person_angle) > 5 else (255, 255, 0), 2)
+            cv2.putText(combined_view, f"ESTADO: {current_state}", (15, 35), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, state_color, 2)
+            cv2.putText(combined_view, f"FPS: {profiler.get_fps():.1f} | Latencia: {profiler.get_total_latency():.0f}ms", (15, 70), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(combined_view, f"Dist. Minima: {min_dist:.2f} m", (15, 105), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.putText(combined_view, f"Target Angle: {person_angle:.1f} deg", (15, 140), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(combined_view, f"Evasion Angle: {escape_angle:.1f} deg", (15, 175), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, state_color, 2)
             
             # Mostrar la ventana
             cv2.imshow("Sistema Integrado - Tesis Air 2S", combined_view)

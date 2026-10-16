@@ -23,9 +23,11 @@ class MetricsLogger:
             # Cabeceras para el análisis en Excel
             self.writer.writerow([
                 "Timestamp", 
+                "Estado_FSM",
                 "Latencia_Total_ms", 
                 "FPS",
                 "Distancia_Obstaculo_m", 
+                "Angulo_Objetivo_deg",
                 "Angulo_Evasion_deg",
                 "Latitud",
                 "Longitud",
@@ -33,13 +35,15 @@ class MetricsLogger:
             ])
             self.file.flush()
             
-    def log(self, timestamp, latency_ms, fps, min_distance, evasion_angle, telemetry):
-        """Escribe una fila de datos en el CSV."""
+    def log(self, timestamp, estado_fsm, latency_ms, fps, min_distance, target_angle, evasion_angle, telemetry):
+        """Escribe una fila de datos en el CSV con el estado actual de la FSM."""
         self.writer.writerow([
             f"{timestamp:.3f}",
+            str(estado_fsm),
             f"{latency_ms:.1f}",
             f"{fps:.1f}",
             f"{min_distance:.2f}",
+            f"{target_angle:.1f}",
             f"{evasion_angle:.1f}",
             f"{telemetry.get('lat', 0.0):.6f}",
             f"{telemetry.get('lon', 0.0):.6f}",

@@ -1,13 +1,13 @@
 import os
 import ctypes
 
-# Inyectar variables de ultra baja latencia en el C-Runtime de Windows (msvcrt) para FFMPEG
+# Inyectar buffer grande (4MB) y threads=1 en Windows msvcrt para eliminar cuelgues de pthread y buffer lag
 opt = (
     "OPENCV_FFMPEG_CAPTURE_OPTIONS=protocol_whitelist;file,rtp,udp|"
-    "fflags;nobuffer|flags;low_delay|probesize;32|analyzeduration;0|max_delay;0"
+    "fflags;nobuffer|flags;low_delay|buffer_size;4194304|threads;1|overrun_nonfatal;1"
 )
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-    "protocol_whitelist;file,rtp,udp|fflags;nobuffer|flags;low_delay|probesize;32|analyzeduration;0|max_delay;0"
+    "protocol_whitelist;file,rtp,udp|fflags;nobuffer|flags;low_delay|buffer_size;4194304|threads;1|overrun_nonfatal;1"
 )
 try:
     ctypes.cdll.msvcrt._putenv(opt.encode("ascii"))
@@ -21,7 +21,8 @@ import time
 class VideoStream:
     """
     Captura el stream de video de RosettaDrone (UDP 5600 via SDP).
-    Usa un hilo en segundo plano con mutex para garantizar cero latencia y descartar cuadros viejos.
+    Usa desacoplamiento rápido grab() / retrieve() y un hilo de lectura continuo
+    para garantizar que el bucle de IA siempre procese el frame más reciente (latencia < 80ms).
     """
     def __init__(self, uri: str = "rosetta.sdp"):
         self.uri = uri
@@ -34,16 +35,18 @@ class VideoStream:
         self.thread = threading.Thread(target=self._update, daemon=True)
         self.thread.start()
         
-        print(f"[VideoStream] Vinculado a {self.uri} (UDP 5600 - Ultra Baja Latencia)...")
+        print(f"[VideoStream] Vinculado a {self.uri} (UDP 5600 - Tiempo Real / Threads=1)...")
 
     def _update(self):
-        """Bucle infinito en segundo plano para limpiar el buffer."""
+        """Bucle infinito en segundo plano para vaciar el buffer de la red."""
         while self.running:
             if self.cap.isOpened():
-                ret, frame = self.cap.read()
-                if ret and frame is not None:
-                    with self.lock:
-                        self.current_frame = frame
+                ret = self.cap.grab()
+                if ret:
+                    ret_decode, frame = self.cap.retrieve()
+                    if ret_decode and frame is not None:
+                        with self.lock:
+                            self.current_frame = frame
                 else:
                     time.sleep(0.005)
             else:

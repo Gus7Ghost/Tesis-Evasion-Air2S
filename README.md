@@ -67,13 +67,15 @@ El dron implementa una FSM determinista para garantizar que el seguimiento de la
 
 ---
 
-## 📊 Matriz de Versiones y Prototipos
+## 📊 Matriz de Versiones y Prototipos con Código Fuente
 
-| Versión | Hito / Descripción | Estado | Bitácora Técnica |
+Cada prototipo posee su propia carpeta con **código fuente ejecutable y su respectivo README**:
+
+| Versión | Hito / Descripción | Estado | Código Fuente y Documentación |
 | :---: | :--- | :---: | :---: |
-| **`v0.1`** | Diseño modular del pipeline, VFH+ inicial y corrección de disparidad monocular. | Completado | [Ver Bitácora v0.1](docs/prototipos/v0.1_README.md) |
-| **`v0.2`** | Integración física con DJI Air 2S, MAVSDK 3.17, bypass de WDAC con HOG y despegue probado. | Completado | [Ver Bitácora v0.2](docs/prototipos/v0.2_README.md) |
-| **`v0.3`** | Implementación de FSM, logging de métricas para tesis a 30 Hz y script de diagnóstico RTSP. | **En curso / Actual** | [Ver Bitácora v0.3](docs/prototipos/v0.3_README.md) |
+| **`v0.1`** | Diseño modular del pipeline, VFH+ inicial y corrección de disparidad monocular. | Completado | [📁 Ver Código y README v0.1](prototipos/v0.1/) |
+| **`v0.2`** | Integración física con DJI Air 2S, MAVSDK 3.17, bypass de WDAC con HOG y despegue probado. | Completado | [📁 Ver Código y README v0.2](prototipos/v0.2/) |
+| **`v0.3`** | Implementación de FSM, logging de métricas para tesis a 30 Hz y script de diagnóstico RTSP. | **En curso / Actual** | [📁 Ver Código y README v0.3](prototipos/v0.3/) |
 | **`v1.0`** | Fine-tuning con dataset urbano de postes/árboles (IDD) y validación en exteriores. | Planificado | - |
 
 ---

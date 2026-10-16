@@ -1,0 +1,10 @@
+# Dependencias congeladas para reproducibilidad (Taller de Investigación - Semana 7)
+# Entorno validado en Windows 11 / Python 3.12
+
+mavsdk==3.17.4
+opencv-python==4.10.0.84
+tensorflow>=2.16.0
+numpy>=1.26.0,<2.6.0
+pyyaml>=6.0.1
+grpcio>=1.64.1
+protobuf>=5.27.0

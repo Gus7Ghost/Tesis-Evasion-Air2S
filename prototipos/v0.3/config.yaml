@@ -4,8 +4,8 @@
 network:
   # Puerto por defecto donde RosettaDrone emite la telemetría MAVLink vía UDP
   mavsdk_connection: "udp://:19980" 
-  # Dirección RTSP del video del dron. (Debes cambiar la IP por la de tu Tablet)
-  video_stream_uri: "rtsp://192.168.43.54:8554/fpv" 
+  # Descriptor SDP para recibir el flujo H.264 emitido por RosettaDrone vía UDP 5600
+  video_stream_uri: "rosetta.sdp" 
 
 perception:
   # MiDaS es excelente para estimación monocular de profundidad en entornos urbanos

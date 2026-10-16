@@ -1,55 +1,60 @@
-import cv2
-import yaml
 import os
-import sys
+import ctypes
 
-def test_rtsp():
-    config_path = "config.yaml"
-    if not os.path.exists(config_path):
-        print(f"[Error] No se encontró {config_path}")
-        return
+# Inyectar la variable directamente en el C-Runtime de Windows (msvcrt) para que la DLL de OpenCV/FFMPEG la lea
+opt = "OPENCV_FFMPEG_CAPTURE_OPTIONS=protocol_whitelist;file,rtp,udp"
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "protocol_whitelist;file,rtp,udp"
+try:
+    ctypes.cdll.msvcrt._putenv(opt.encode("ascii"))
+except Exception as e:
+    print(f"[Aviso msvcrt] {e}")
 
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
+import cv2
+import time
 
-    rtsp_uri = config.get("network", {}).get("video_stream_uri", "")
-    print("=" * 60)
-    print("  TEST RÁPIDO DE CÁMARA RTSP (Air 2S / RosettaDrone)")
-    print("=" * 60)
-    print(f"Probando conexión a: {rtsp_uri}")
-    print("Presiona 'q' en la ventana para salir.\n")
+def test_stream():
+    print("=" * 65)
+    print("  TEST DE RECEPCIÓN DE VIDEO ROSETTADRONE (UDP Puerto 5600)")
+    print("=" * 65)
 
-    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp|fflags;nobuffer|flags;low_delay"
-    cap = cv2.VideoCapture(rtsp_uri, cv2.CAP_FFMPEG)
+    sdp_path = "rosetta.sdp"
+    if not os.path.exists(sdp_path):
+        with open(sdp_path, "w") as f:
+            f.write("c=IN IP4 0.0.0.0\nm=video 5600 RTP/AVP 96\na=rtpmap:96 H264/90000\n")
+
+    print(f"Abriendo descriptor SDP ({sdp_path}) escuchando en UDP :5600...")
+    cap = cv2.VideoCapture(sdp_path, cv2.CAP_FFMPEG)
 
     if not cap.isOpened():
-        print(f"[FALLO] No se pudo conectar al flujo RTSP.")
-        print("Causas posibles:")
-        print(" 1. La IP de la tablet cambió (Verifícala en la pantalla de la tablet).")
-        print(" 2. En RosettaDrone no está encendido el switch 'Enable Video Streaming'.")
-        print(" 3. El firewall de Windows está bloqueando el puerto 8554.")
+        print("\n[ERROR] No se pudo abrir el descriptor SDP.")
         return
 
-    print("[ÉXITO] Conexión RTSP establecida. Esperando frames...")
+    print("\n[ÉXITO TOTAL] Socket UDP 5600 y FFMPEG vinculados correctamente!")
+    print("Esperando frames de video del DJI Air 2S... (Presiona 'q' para salir)\n")
+
     frame_count = 0
+    start_time = time.time()
 
     while True:
         ret, frame = cap.read()
-        if not ret:
-            print("[Advertencia] Se perdió el frame o hubo timeout...")
+        if not ret or frame is None:
+            # Esperando el primer frame
+            if frame_count == 0 and time.time() - start_time > 10:
+                print("[Esperando señal... Asegúrate que en la tablet se vea la cámara del dron]")
+                start_time = time.time()
             continue
 
         frame_count += 1
-        cv2.putText(frame, f"Air2S Stream OK - Frames: {frame_count}", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.imshow("Test Camara RosettaDrone", frame)
+        cv2.putText(frame, f"DJI Air 2S - Frames: {frame_count}", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        cv2.imshow("Video en Vivo - DJI Air 2S", frame)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
     cap.release()
     cv2.destroyAllWindows()
-    print("[INFO] Test de video finalizado.")
+    print("[INFO] Test de video finalizado con éxito.")
 
 if __name__ == "__main__":
-    test_rtsp()
+    test_stream()

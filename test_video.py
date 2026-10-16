@@ -1,20 +1,58 @@
 import os
 import ctypes
 
-# Inyectar la variable directamente en el C-Runtime de Windows (msvcrt) para que la DLL de OpenCV/FFMPEG la lea
-opt = "OPENCV_FFMPEG_CAPTURE_OPTIONS=protocol_whitelist;file,rtp,udp"
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "protocol_whitelist;file,rtp,udp"
+# 1. Configurar bajo nivel en Windows para lectura inmediata sin buffer ni análisis previo
+opt = (
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS=protocol_whitelist;file,rtp,udp|"
+    "fflags;nobuffer|flags;low_delay|probesize;32|analyzeduration;0|max_delay;0"
+)
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+    "protocol_whitelist;file,rtp,udp|fflags;nobuffer|flags;low_delay|probesize;32|analyzeduration;0|max_delay;0"
+)
 try:
     ctypes.cdll.msvcrt._putenv(opt.encode("ascii"))
-except Exception as e:
-    print(f"[Aviso msvcrt] {e}")
+except Exception:
+    pass
 
 import cv2
+import threading
 import time
+
+class FastVideoReceiver:
+    """Hilo de lectura continua para eliminar el buffer y la latencia."""
+    def __init__(self, sdp_path="rosetta.sdp"):
+        self.cap = cv2.VideoCapture(sdp_path, cv2.CAP_FFMPEG)
+        self.frame = None
+        self.running = True
+        self.lock = threading.Lock()
+        
+        self.thread = threading.Thread(target=self._reader, daemon=True)
+        self.thread.start()
+
+    def _reader(self):
+        while self.running:
+            if self.cap.isOpened():
+                ret, frame = self.cap.read()
+                if ret and frame is not None:
+                    with self.lock:
+                        self.frame = frame
+                else:
+                    time.sleep(0.005)
+            else:
+                time.sleep(0.05)
+
+    def get_latest_frame(self):
+        with self.lock:
+            return self.frame
+
+    def stop(self):
+        self.running = False
+        if self.cap.isOpened():
+            self.cap.release()
 
 def test_stream():
     print("=" * 65)
-    print("  TEST DE RECEPCIÓN DE VIDEO ROSETTADRONE (UDP Puerto 5600)")
+    print("  TEST DE VIDEO DE ULTRA BAJA LATENCIA (DJI Air 2S)")
     print("=" * 65)
 
     sdp_path = "rosetta.sdp"
@@ -22,39 +60,42 @@ def test_stream():
         with open(sdp_path, "w") as f:
             f.write("c=IN IP4 0.0.0.0\nm=video 5600 RTP/AVP 96\na=rtpmap:96 H264/90000\n")
 
-    print(f"Abriendo descriptor SDP ({sdp_path}) escuchando en UDP :5600...")
-    cap = cv2.VideoCapture(sdp_path, cv2.CAP_FFMPEG)
+    print("[Info] Conectando hilo receptor...")
+    receiver = FastVideoReceiver(sdp_path)
 
-    if not cap.isOpened():
-        print("\n[ERROR] No se pudo abrir el descriptor SDP.")
-        return
-
-    print("\n[ÉXITO TOTAL] Socket UDP 5600 y FFMPEG vinculados correctamente!")
-    print("Esperando frames de video del DJI Air 2S... (Presiona 'q' para salir)\n")
-
+    print("Esperando primer fotograma maestro (I-Frame)...")
     frame_count = 0
-    start_time = time.time()
+    fps_time = time.time()
+    fps = 0
 
     while True:
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            # Esperando el primer frame
-            if frame_count == 0 and time.time() - start_time > 10:
-                print("[Esperando señal... Asegúrate que en la tablet se vea la cámara del dron]")
-                start_time = time.time()
+        frame = receiver.get_latest_frame()
+        if frame is None:
+            time.sleep(0.01)
             continue
 
         frame_count += 1
-        cv2.putText(frame, f"DJI Air 2S - Frames: {frame_count}", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-        cv2.imshow("Video en Vivo - DJI Air 2S", frame)
+        now = time.time()
+        if now - fps_time >= 1.0:
+            fps = frame_count / (now - fps_time)
+            frame_count = 0
+            fps_time = now
+
+        # HUD en vivo
+        display = frame.copy()
+        cv2.putText(display, f"Air 2S Live Stream | FPS: {fps:.1f}", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.putText(display, "Presiona 'q' para salir", (20, 75),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+        cv2.imshow("Video en Vivo - DJI Air 2S (Cero Latencia)", display)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-    cap.release()
+    receiver.stop()
     cv2.destroyAllWindows()
-    print("[INFO] Test de video finalizado con éxito.")
+    print("[INFO] Test finalizado exitosamente.")
 
 if __name__ == "__main__":
     test_stream()

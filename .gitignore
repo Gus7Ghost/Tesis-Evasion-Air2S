@@ -21,3 +21,9 @@ logs/
 
 # Configuración local (Opcional, pero se suele ignorar si tiene IPs privadas)
 # config.yaml
+
+# Datasets y datos temporales
+datasets/
+test_data/
+*.npz
+*.sdp

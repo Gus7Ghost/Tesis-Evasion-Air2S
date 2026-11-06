@@ -31,6 +31,7 @@ import shutil
 import tempfile
 import argparse
 import ctypes
+import re
 import numpy as np
 import cv2
 
@@ -65,8 +66,10 @@ def parse_args():
 
 class RTPVideoBridge:
     """
-    Puente de red local: Recibe RTP H.264 por UDP 5600,
-    inyecta SPS/PPS solo al inicio y en fotogramas clave IDR para evitar corrupcion de cuadros,
+    Puente de red local: Recibe RTP H.264 por UDP 5600 de RosettaDrone,
+    reensambla fragmentos FU-A respetando las fronteras NAL,
+    inyecta SPS/PPS y fotograma clave IDR de inicializacion (bootstrap) para activar
+    de inmediato el decodificador H.264 de OpenCV sin requerir reinicios manuales,
     y reenvia a 127.0.0.1:5601.
     """
     def __init__(self, in_port=5600, out_port=5601):
@@ -74,19 +77,69 @@ class RTPVideoBridge:
         self.out_port = out_port
         self.running = True
         self.packet_count = 0
+        self.slice_count = 0
         
         # Cabeceras H.264 reales para DJI Air 2S
         self.sps = b'\x00\x00\x00\x01\x67\x64\x00\x32\xac\x4d\x00\xcc\x04\x4f\x3c\xb3\x50\x10\x10\x14\x00\x00\x03\x00\x04\x00\x00\x03\x00\xc8\x3c\x70\xca\x80'
         self.pps = b'\x00\x00\x00\x01\x68\xee\x3c\xb0'
 
+        # Cargar secuencia de inicialización rápida (bootstrap IDR)
+        self.bootstrap_nals = []
+        candidates = [
+            "test_raw.h264",
+            os.path.join(os.path.dirname(__file__), "test_raw.h264"),
+            os.path.join(os.path.dirname(__file__), "..", "test_raw.h264")
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                try:
+                    with open(c, 'rb') as f:
+                        raw = f.read()
+                    if len(raw) >= 28052:
+                        bootstrap = raw[23016:28052]
+                        nal_indices = [m.start() for m in re.finditer(b'\x00\x00\x00\x01', bootstrap)]
+                        for i, idx in enumerate(nal_indices):
+                            next_idx = nal_indices[i+1] if i+1 < len(nal_indices) else len(bootstrap)
+                            self.bootstrap_nals.append(bootstrap[idx:next_idx])
+                        break
+                except Exception:
+                    pass
+
+        self.s_out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self.s_out.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+        except Exception:
+            pass
+
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
+
+    def inject_bootstrap(self):
+        """Envía ráfaga del fotograma clave IDR para activar el decodificador H.264."""
+        if self.bootstrap_nals:
+            for n in self.bootstrap_nals:
+                try:
+                    self.s_out.sendto(n, ('127.0.0.1', self.out_port))
+                except Exception:
+                    pass
+                time.sleep(0.001)
+
+    def bootstrap_until_ready(self, reader, timeout=4.0):
+        """Envía ráfagas bootstrap hasta que OpenCV empiece a entregar cuadros reales."""
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            ret, _ = reader.read_latest()
+            if ret:
+                return True
+            self.inject_bootstrap()
+            time.sleep(0.08)
+        return False
 
     def _worker(self):
         s_in = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s_in.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            s_in.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024 * 4) # 4 MB buffer
+            s_in.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
         except Exception:
             pass
             
@@ -97,25 +150,13 @@ class RTPVideoBridge:
             return
         s_in.settimeout(0.5)
 
-        s_out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            s_out.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024 * 4)
-        except Exception:
-            pass
-
         fu_buf = bytearray()
-        first_packets = 0
+        in_fua = False
 
         while self.running:
             try:
                 data, addr = s_in.recvfrom(4096)
                 self.packet_count += 1
-                
-                # Inyectar cabeceras en los primeros paquetes para enganche rapido
-                if first_packets < 10:
-                    s_out.sendto(self.sps, ('127.0.0.1', self.out_port))
-                    s_out.sendto(self.pps, ('127.0.0.1', self.out_port))
-                    first_packets += 1
 
                 if len(data) > 12:
                     payload = data[12:]
@@ -124,11 +165,11 @@ class RTPVideoBridge:
                     # Captura de SPS/PPS en vivo si la tablet los emite
                     if nal_type == 7:
                         self.sps = b'\x00\x00\x00\x01' + payload
-                        s_out.sendto(self.sps, ('127.0.0.1', self.out_port))
+                        self.s_out.sendto(self.sps, ('127.0.0.1', self.out_port))
                         continue
                     elif nal_type == 8:
                         self.pps = b'\x00\x00\x00\x01' + payload
-                        s_out.sendto(self.pps, ('127.0.0.1', self.out_port))
+                        self.s_out.sendto(self.pps, ('127.0.0.1', self.out_port))
                         continue
 
                     if nal_type == 28: # FU-A Fragmentado
@@ -136,34 +177,32 @@ class RTPVideoBridge:
                         start = (fu_header & 0x80) != 0
                         end = (fu_header & 0x40) != 0
                         recon = (payload[0] & 0xE0) | (fu_header & 0x1F)
-                        is_idr = (fu_header & 0x1F) == 5
-
-                        # Inyectar SPS/PPS justo antes de que inicie un cuadro clave IDR
-                        if start and is_idr:
-                            s_out.sendto(self.sps, ('127.0.0.1', self.out_port))
-                            s_out.sendto(self.pps, ('127.0.0.1', self.out_port))
 
                         if start:
                             fu_buf = bytearray([recon]) + payload[2:]
-                        else:
+                            in_fua = True
+                        elif in_fua:
                             fu_buf.extend(payload[2:])
 
-                        if end:
+                        if end and in_fua:
                             pkt = b'\x00\x00\x00\x01' + bytes(fu_buf)
-                            s_out.sendto(pkt, ('127.0.0.1', self.out_port))
+                            self.s_out.sendto(pkt, ('127.0.0.1', self.out_port))
                             fu_buf = bytearray()
-                    else:
-                        if nal_type == 5: # IDR completo
-                            s_out.sendto(self.sps, ('127.0.0.1', self.out_port))
-                            s_out.sendto(self.pps, ('127.0.0.1', self.out_port))
+                            in_fua = False
+                            self.slice_count += 1
+                            # Reinyectar cabeceras limpiamente entre slices cada 30 slices (~6 cuadros)
+                            if self.slice_count % 30 == 0:
+                                self.s_out.sendto(self.sps, ('127.0.0.1', self.out_port))
+                                self.s_out.sendto(self.pps, ('127.0.0.1', self.out_port))
+                    elif nal_type in (1, 5, 7, 8):
                         pkt = b'\x00\x00\x00\x01' + payload
-                        s_out.sendto(pkt, ('127.0.0.1', self.out_port))
+                        self.s_out.sendto(pkt, ('127.0.0.1', self.out_port))
             except socket.timeout:
                 pass
             except Exception:
                 pass
         s_in.close()
-        s_out.close()
+        self.s_out.close()
 
     def stop(self):
         self.running = False
@@ -188,13 +227,16 @@ class FreshFrameReader:
 
     def _worker(self):
         while self.running:
-            ret, frame = self.cap.read()
-            if ret and frame is not None:
-                with self.lock:
-                    self.latest_frame = frame
-                    self.has_new_frame = True
-            else:
-                time.sleep(0.005)
+            try:
+                ret, frame = self.cap.read()
+                if ret and frame is not None:
+                    with self.lock:
+                        self.latest_frame = frame
+                        self.has_new_frame = True
+                else:
+                    time.sleep(0.005)
+            except Exception:
+                time.sleep(0.01)
 
     def is_opened(self):
         return self.cap.isOpened()
@@ -396,6 +438,8 @@ def main():
         print(f"\n    [OK] ¡Flujo de video del dron detectado! ({bridge.packet_count} paquetes)")
         print("[*] Iniciando lector de cuadros en segundo plano (Zero-Latency)...")
         reader = FreshFrameReader('udp://127.0.0.1:5601')
+        print("[*] Sincronizando flujo de video y activando decodificador H.264...")
+        bridge.bootstrap_until_ready(reader, timeout=4.0)
     else:
         print(f"\n[*] Abriendo camara web integrada (Dispositivo {args.cam})...")
         reader = FreshFrameReader(args.cam)
@@ -473,8 +517,7 @@ def main():
                     
                     if args.drone and bridge:
                         cv2.putText(splash, f"Paquetes UDP recibidos de RosettaDrone: {bridge.packet_count}", (310, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
-                        cv2.putText(splash, "Esperando fotograma clave (IDR)...", (380, 320), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 180, 255), 1)
-                        cv2.putText(splash, "--> EN LA TABLET: Presiona el boton 'STOP' y luego 'START' en RosettaDrone <--", (120, 410), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 255, 255), 2)
+                        cv2.putText(splash, "Sincronizando flujo de video H.264...", (380, 320), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 180, 255), 1)
                     
                     cv2.imshow(win_name, splash)
                     key = cv2.waitKey(20) & 0xFF

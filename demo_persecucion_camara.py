@@ -30,8 +30,17 @@ import threading
 import shutil
 import tempfile
 import argparse
+import ctypes
 import numpy as np
 import cv2
+
+# Configurar variables de entorno C-runtime para FFmpeg en Windows
+opt = "OPENCV_FFMPEG_CAPTURE_OPTIONS=protocol_whitelist;file,rtp,udp|fflags;nobuffer|flags;low_delay|threads;1|overrun_nonfatal;1"
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "protocol_whitelist;file,rtp,udp|fflags;nobuffer|flags;low_delay|threads;1|overrun_nonfatal;1"
+try:
+    ctypes.cdll.msvcrt._putenv(opt.encode("ascii"))
+except Exception:
+    pass
 
 # Suprimir advertencias menores de TensorFlow
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -56,11 +65,9 @@ def parse_args():
 
 class RTPVideoBridge:
     """
-    Puente de red local para recepcion de video RTP de DJI Air 2S:
-    - Recibe paquetes RTP H.264 por UDP 5600.
-    - Reensambla fragmentos FU-A.
-    - Reinyecta SPS y PPS periodicamente para que OpenCV enganche al instante.
-    - Reenvia el flujo a 127.0.0.1:5601 para consumo por OpenCV FFMPEG.
+    Puente de red local: Recibe RTP H.264 por UDP 5600,
+    inyecta SPS/PPS solo al inicio y en fotogramas clave IDR para evitar corrupcion de cuadros,
+    y reenvia a 127.0.0.1:5601.
     """
     def __init__(self, in_port=5600, out_port=5601):
         self.in_port = in_port
@@ -79,7 +86,7 @@ class RTPVideoBridge:
         s_in = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s_in.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            s_in.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024 * 4)
+            s_in.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024 * 4) # 4 MB buffer
         except Exception:
             pass
             
@@ -97,62 +104,60 @@ class RTPVideoBridge:
             pass
 
         fu_buf = bytearray()
-        pkt_c = 0
+        first_packets = 0
 
         while self.running:
             try:
                 data, addr = s_in.recvfrom(4096)
                 self.packet_count += 1
-                pkt_c += 1
                 
-                # Inyectar SPS/PPS cada 25 paquetes para que el decodificador nunca pierda referencia
-                if pkt_c % 25 == 1:
+                # Inyectar cabeceras en los primeros paquetes para enganche rapido
+                if first_packets < 10:
                     s_out.sendto(self.sps, ('127.0.0.1', self.out_port))
                     s_out.sendto(self.pps, ('127.0.0.1', self.out_port))
+                    first_packets += 1
 
-                if len(data) < 13:
-                    continue
+                if len(data) > 12:
+                    payload = data[12:]
+                    nal_type = payload[0] & 0x1F
 
-                payload = data[12:]
-                nal_type = payload[0] & 0x1F
-
-                # Capturar SPS/PPS dinamicos si RosettaDrone los emite
-                if nal_type == 7:
-                    self.sps = b'\x00\x00\x00\x01' + payload
-                    s_out.sendto(self.sps, ('127.0.0.1', self.out_port))
-                    continue
-                elif nal_type == 8:
-                    self.pps = b'\x00\x00\x00\x01' + payload
-                    s_out.sendto(self.pps, ('127.0.0.1', self.out_port))
-                    continue
-
-                if nal_type == 28: # FU-A Fragmentado
-                    fu_header = payload[1]
-                    start = (fu_header & 0x80) != 0
-                    end = (fu_header & 0x40) != 0
-                    recon = (payload[0] & 0xE0) | (fu_header & 0x1F)
-                    is_idr = (fu_header & 0x1F) == 5
-
-                    # Inyectar SPS/PPS antes de un fotograma clave IDR
-                    if start and is_idr:
+                    # Captura de SPS/PPS en vivo si la tablet los emite
+                    if nal_type == 7:
+                        self.sps = b'\x00\x00\x00\x01' + payload
                         s_out.sendto(self.sps, ('127.0.0.1', self.out_port))
+                        continue
+                    elif nal_type == 8:
+                        self.pps = b'\x00\x00\x00\x01' + payload
                         s_out.sendto(self.pps, ('127.0.0.1', self.out_port))
+                        continue
 
-                    if start:
-                        fu_buf = bytearray([recon]) + payload[2:]
+                    if nal_type == 28: # FU-A Fragmentado
+                        fu_header = payload[1]
+                        start = (fu_header & 0x80) != 0
+                        end = (fu_header & 0x40) != 0
+                        recon = (payload[0] & 0xE0) | (fu_header & 0x1F)
+                        is_idr = (fu_header & 0x1F) == 5
+
+                        # Inyectar SPS/PPS justo antes de que inicie un cuadro clave IDR
+                        if start and is_idr:
+                            s_out.sendto(self.sps, ('127.0.0.1', self.out_port))
+                            s_out.sendto(self.pps, ('127.0.0.1', self.out_port))
+
+                        if start:
+                            fu_buf = bytearray([recon]) + payload[2:]
+                        else:
+                            fu_buf.extend(payload[2:])
+
+                        if end:
+                            pkt = b'\x00\x00\x00\x01' + bytes(fu_buf)
+                            s_out.sendto(pkt, ('127.0.0.1', self.out_port))
+                            fu_buf = bytearray()
                     else:
-                        fu_buf.extend(payload[2:])
-
-                    if end:
-                        pkt = b'\x00\x00\x00\x01' + bytes(fu_buf)
+                        if nal_type == 5: # IDR completo
+                            s_out.sendto(self.sps, ('127.0.0.1', self.out_port))
+                            s_out.sendto(self.pps, ('127.0.0.1', self.out_port))
+                        pkt = b'\x00\x00\x00\x01' + payload
                         s_out.sendto(pkt, ('127.0.0.1', self.out_port))
-                        fu_buf = bytearray()
-                else:
-                    if nal_type == 5: # IDR no fragmentado
-                        s_out.sendto(self.sps, ('127.0.0.1', self.out_port))
-                        s_out.sendto(self.pps, ('127.0.0.1', self.out_port))
-                    pkt = b'\x00\x00\x00\x01' + payload
-                    s_out.sendto(pkt, ('127.0.0.1', self.out_port))
             except socket.timeout:
                 pass
             except Exception:
@@ -171,14 +176,7 @@ class FreshFrameReader:
     Elimina por completo la acumulacion de latencia y los bloqueos "(No responde)".
     """
     def __init__(self, src_uri):
-        if isinstance(src_uri, str) and 'udp://' in src_uri:
-            # Parametros de ultra baja latencia
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "fflags;nobuffer|flags;low_delay"
-            uri = src_uri + "?overrun_nonfatal=1&fifo_size=50000000"
-            self.cap = cv2.VideoCapture(uri, cv2.CAP_FFMPEG)
-        else:
-            self.cap = cv2.VideoCapture(src_uri)
-            
+        self.cap = cv2.VideoCapture(src_uri, cv2.CAP_FFMPEG)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.latest_frame = None
         self.has_new_frame = False
@@ -475,8 +473,8 @@ def main():
                     
                     if args.drone and bridge:
                         cv2.putText(splash, f"Paquetes UDP recibidos de RosettaDrone: {bridge.packet_count}", (310, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
-                        cv2.putText(splash, "Esperando fotograma clave de inicio...", (380, 320), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 180, 255), 1)
-                        cv2.putText(splash, "[TIP] En RosettaDrone, apaga y vuelve a encender 'Enable video feed' si demora", (150, 410), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+                        cv2.putText(splash, "Esperando fotograma clave (IDR)...", (380, 320), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 180, 255), 1)
+                        cv2.putText(splash, "--> EN LA TABLET: Presiona el boton 'STOP' y luego 'START' en RosettaDrone <--", (120, 410), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 255, 255), 2)
                     
                     cv2.imshow(win_name, splash)
                     key = cv2.waitKey(20) & 0xFF

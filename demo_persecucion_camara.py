@@ -121,6 +121,7 @@ class RTPVideoBridge:
         in_fua = False
         slice_corrupt = False
         last_seq = None
+        inner_type = 0
 
         while self.running:
             try:
@@ -148,6 +149,7 @@ class RTPVideoBridge:
                         recon = (payload[0] & 0xE0) | (fu_header & 0x1F)
 
                         if start:
+                            inner_type = fu_header & 0x1F
                             fu_buf = bytearray([recon]) + payload[2:]
                             in_fua = True
                             slice_corrupt = False
@@ -163,12 +165,23 @@ class RTPVideoBridge:
                         if end and in_fua:
                             # Solo enviar si la rebanada está completa y no sufrió pérdida de paquetes
                             if not slice_corrupt and len(fu_buf) > 1:
+                                if inner_type == 5:
+                                    # Anteponer SPS y PPS inmediatamente antes del fotograma clave IDR
+                                    self.s_out.sendto(self.sps, ('127.0.0.1', self.out_port))
+                                    self.s_out.sendto(self.pps, ('127.0.0.1', self.out_port))
                                 pkt = b'\x00\x00\x00\x01' + bytes(fu_buf)
                                 self.s_out.sendto(pkt, ('127.0.0.1', self.out_port))
                                 self.slice_count += 1
                             fu_buf = bytearray()
                             in_fua = False
-                    elif nal_type in (1, 5, 6):
+                    elif nal_type == 5:
+                        # NAL IDR directo: anteponer SPS y PPS
+                        self.s_out.sendto(self.sps, ('127.0.0.1', self.out_port))
+                        self.s_out.sendto(self.pps, ('127.0.0.1', self.out_port))
+                        pkt = b'\x00\x00\x00\x01' + payload
+                        self.s_out.sendto(pkt, ('127.0.0.1', self.out_port))
+                        self.slice_count += 1
+                    elif nal_type in (1, 6):
                         pkt = b'\x00\x00\x00\x01' + payload
                         self.s_out.sendto(pkt, ('127.0.0.1', self.out_port))
                         self.slice_count += 1
@@ -412,6 +425,8 @@ def main():
             
         print(f"\n    [OK] ¡Flujo de video del dron detectado! ({bridge.packet_count} paquetes)")
         print("[*] Sincronizando cabeceras H.264 e iniciando decodificador (Zero-Latency)...")
+        print("[!] ACCIÓN EN LA TABLET: En RosettaDrone pulsa 'STOP' y luego 'START'")
+        print("    (o en Ajustes confirma 'Video bitrate' en 2500 kbps) para emitir el fotograma clave.\n")
         bridge.send_initial_headers()
         reader = FreshFrameReader('udp://127.0.0.1:5601')
     else:
@@ -490,8 +505,10 @@ def main():
                     cv2.putText(splash, "Sincronizando flujo de video H.264 de la camara...", (260, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.70, (255, 255, 255), 2)
                     
                     if args.drone and bridge:
-                        cv2.putText(splash, f"Paquetes UDP recibidos de RosettaDrone: {bridge.packet_count}", (310, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
-                        cv2.putText(splash, "Sincronizando flujo de video H.264 en tiempo real...", (340, 320), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 220, 255), 2)
+                        cv2.putText(splash, f"Paquetes UDP recibidos de RosettaDrone: {bridge.packet_count}", (310, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+                        cv2.putText(splash, "Esperando fotograma clave (IDR)...", (400, 310), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 220, 255), 2)
+                        cv2.putText(splash, "--> EN LA TABLET: Pulsa 'STOP' y luego 'START' en RosettaDrone <--", (160, 380), cv2.FONT_HERSHEY_SIMPLEX, 0.70, (0, 255, 255), 2)
+                        cv2.putText(splash, "(o en Ajustes confirma el bitrate en 2500 kbps para iniciar)", (260, 420), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
                     
                     cv2.imshow(win_name, splash)
                     key = cv2.waitKey(20) & 0xFF

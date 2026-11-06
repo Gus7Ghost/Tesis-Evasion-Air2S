@@ -109,6 +109,15 @@ network:
 ```
 
 ### Ejecución:
+* **Demostración en Vivo en Pantalla Dividida (Persecución + Estimación MiDaS en Tiempo Real):**
+  - Con Cámara Web Local:
+    ```bash
+    python demo_persecucion_camara.py
+    ```
+  - Con Cámara del Dron DJI Air 2S (vía RosettaDrone UDP 5600, Motores Apagados):
+    ```bash
+    python demo_persecucion_camara.py --drone
+    ```
 * **Prueba aislada de cámara (Sin motores):**
   ```bash
   python test_video.py

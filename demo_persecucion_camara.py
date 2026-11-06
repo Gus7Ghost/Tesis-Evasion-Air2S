@@ -56,23 +56,19 @@ def parse_args():
 
 class RTPVideoBridge:
     """
-    Puente de red local con control de integridad RTP:
-    1. Valida la secuencia de paquetes (Sequence Number): si se pierde un paquete por Wi-Fi,
-       descarta ese NAL incompleto para que FFMPEG NO reciba macrobloques corruptos
-       (evita la pantalla verde y el pixelado distorsionado).
-    2. Inyecta SPS/PPS limpio antes de cada fotograma clave IDR.
+    Puente de red local para recepcion de video RTP de DJI Air 2S:
+    - Recibe paquetes RTP H.264 por UDP 5600.
+    - Reensambla fragmentos FU-A.
+    - Reinyecta SPS y PPS periodicamente para que OpenCV enganche al instante.
+    - Reenvia el flujo a 127.0.0.1:5601 para consumo por OpenCV FFMPEG.
     """
     def __init__(self, in_port=5600, out_port=5601):
         self.in_port = in_port
         self.out_port = out_port
         self.running = True
         self.packet_count = 0
-        self.last_seq = None
-        self.fu_buf = bytearray()
-        self.fu_in_progress = False
-        self.fu_corrupted = False
         
-        # Cabeceras H.264 estandar para DJI Air 2S
+        # Cabeceras H.264 reales para DJI Air 2S
         self.sps = b'\x00\x00\x00\x01\x67\x64\x00\x32\xac\x4d\x00\xcc\x04\x4f\x3c\xb3\x50\x10\x10\x14\x00\x00\x03\x00\x04\x00\x00\x03\x00\xc8\x3c\x70\xca\x80'
         self.pps = b'\x00\x00\x00\x01\x68\xee\x3c\xb0'
 
@@ -82,7 +78,6 @@ class RTPVideoBridge:
     def _worker(self):
         s_in = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s_in.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        # Bufer de recepcion amplio (4 MB) para absorber ráfagas de Wi-Fi
         try:
             s_in.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024 * 4)
         except Exception:
@@ -101,35 +96,27 @@ class RTPVideoBridge:
         except Exception:
             pass
 
-        first_packets = 0
+        fu_buf = bytearray()
+        pkt_c = 0
 
         while self.running:
             try:
                 data, addr = s_in.recvfrom(4096)
                 self.packet_count += 1
+                pkt_c += 1
                 
-                if len(data) < 13:
-                    continue
-
-                # 1. Comprobar secuencia RTP para detectar paquetes perdidos en Wi-Fi
-                seq = struct.unpack('!H', data[2:4])[0]
-                is_seq_loss = False
-                if self.last_seq is not None:
-                    expected = (self.last_seq + 1) & 0xFFFF
-                    if seq != expected:
-                        is_seq_loss = True
-                self.last_seq = seq
-
-                # Enviar cabeceras iniciales para enganche rapido
-                if first_packets < 5:
+                # Inyectar SPS/PPS cada 25 paquetes para que el decodificador nunca pierda referencia
+                if pkt_c % 25 == 1:
                     s_out.sendto(self.sps, ('127.0.0.1', self.out_port))
                     s_out.sendto(self.pps, ('127.0.0.1', self.out_port))
-                    first_packets += 1
+
+                if len(data) < 13:
+                    continue
 
                 payload = data[12:]
                 nal_type = payload[0] & 0x1F
 
-                # Capturar SPS/PPS en vivo si vienen de RosettaDrone
+                # Capturar SPS/PPS dinamicos si RosettaDrone los emite
                 if nal_type == 7:
                     self.sps = b'\x00\x00\x00\x01' + payload
                     s_out.sendto(self.sps, ('127.0.0.1', self.out_port))
@@ -146,31 +133,22 @@ class RTPVideoBridge:
                     recon = (payload[0] & 0xE0) | (fu_header & 0x1F)
                     is_idr = (fu_header & 0x1F) == 5
 
-                    if start:
-                        # Cuadro clave IDR: inyectar cabeceras antes para reconstruccion perfecta
-                        if is_idr:
-                            s_out.sendto(self.sps, ('127.0.0.1', self.out_port))
-                            s_out.sendto(self.pps, ('127.0.0.1', self.out_port))
-                        self.fu_buf = bytearray([recon]) + payload[2:]
-                        self.fu_in_progress = True
-                        self.fu_corrupted = False
-                    elif self.fu_in_progress:
-                        if is_seq_loss:
-                            # Se perdio un pedazo del paquete en Wi-Fi: marcar corrupto
-                            self.fu_corrupted = True
-                        if not self.fu_corrupted:
-                            self.fu_buf.extend(payload[2:])
+                    # Inyectar SPS/PPS antes de un fotograma clave IDR
+                    if start and is_idr:
+                        s_out.sendto(self.sps, ('127.0.0.1', self.out_port))
+                        s_out.sendto(self.pps, ('127.0.0.1', self.out_port))
 
-                    if end and self.fu_in_progress:
-                        # Solo reenviar a OpenCV si el cuadro esta 100% integro
-                        if not self.fu_corrupted and not is_seq_loss:
-                            pkt = b'\x00\x00\x00\x01' + bytes(self.fu_buf)
-                            s_out.sendto(pkt, ('127.0.0.1', self.out_port))
-                        self.fu_buf = bytearray()
-                        self.fu_in_progress = False
-                        self.fu_corrupted = False
+                    if start:
+                        fu_buf = bytearray([recon]) + payload[2:]
+                    else:
+                        fu_buf.extend(payload[2:])
+
+                    if end:
+                        pkt = b'\x00\x00\x00\x01' + bytes(fu_buf)
+                        s_out.sendto(pkt, ('127.0.0.1', self.out_port))
+                        fu_buf = bytearray()
                 else:
-                    if nal_type == 5: # IDR completo
+                    if nal_type == 5: # IDR no fragmentado
                         s_out.sendto(self.sps, ('127.0.0.1', self.out_port))
                         s_out.sendto(self.pps, ('127.0.0.1', self.out_port))
                     pkt = b'\x00\x00\x00\x01' + payload
@@ -188,14 +166,14 @@ class RTPVideoBridge:
 class FreshFrameReader:
     """
     Lector de video en segundo plano dedicado:
-    Consume continuamente los fotogramas del buffer de OpenCV a máxima velocidad
-    y entrega SIEMPRE el cuadro más reciente en tiempo real.
-    Elimina por completo la acumulación de latencia y los bloqueos "(No responde)".
+    Consume continuamente los fotogramas del buffer de OpenCV a maxima velocidad
+    y entrega SIEMPRE el cuadro mas reciente en tiempo real.
+    Elimina por completo la acumulacion de latencia y los bloqueos "(No responde)".
     """
     def __init__(self, src_uri):
         if isinstance(src_uri, str) and 'udp://' in src_uri:
-            # Configurar opciones de baja latencia y descarte de cuadros corruptos para FFMPEG
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "fflags;nobuffer|fflags;discardcorrupt|flags;low_delay"
+            # Parametros de ultra baja latencia
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "fflags;nobuffer|flags;low_delay"
             uri = src_uri + "?overrun_nonfatal=1&fifo_size=50000000"
             self.cap = cv2.VideoCapture(uri, cv2.CAP_FFMPEG)
         else:
@@ -489,8 +467,21 @@ def main():
             if not paused:
                 ret, frame = reader.read_latest()
                 if not ret or frame is None:
-                    # Siempre procesar eventos de ventana para que Windows no marque "(No responde)"
-                    cv2.waitKey(5)
+                    # Mostrar pantalla de sincronización interactiva en lugar de ventana gris vacía
+                    splash = np.zeros((540, 1280, 3), dtype=np.uint8)
+                    splash[:] = (30, 30, 30)
+                    cv2.putText(splash, "TESIS UNI - SISTEMA DE PERSECUCION Y PROFUNDIDAD", (180, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 220, 255), 2)
+                    cv2.putText(splash, "Sincronizando flujo de video H.264 de la camara...", (260, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.70, (255, 255, 255), 2)
+                    
+                    if args.drone and bridge:
+                        cv2.putText(splash, f"Paquetes UDP recibidos de RosettaDrone: {bridge.packet_count}", (310, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+                        cv2.putText(splash, "Esperando fotograma clave de inicio...", (380, 320), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 180, 255), 1)
+                        cv2.putText(splash, "[TIP] En RosettaDrone, apaga y vuelve a encender 'Enable video feed' si demora", (150, 410), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+                    
+                    cv2.imshow(win_name, splash)
+                    key = cv2.waitKey(20) & 0xFF
+                    if key == ord('q') or key == 27:
+                        break
                     continue
 
                 frame_count += 1

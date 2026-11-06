@@ -16,6 +16,7 @@ En cumplimiento estricto con los lineamientos metodológicos de la **Semana 07 (
 
 * 🗺️ **[Plan de Implementación Incremental](docs/PLAN_IMPLEMENTACION.md):** Descomposición modular estricta (Entradas, Procesamiento, Salidas), cronograma de 3 hitos de avance y métricas técnicas.
 * 🛡️ **[Matriz de Gestión de Riesgos y Mitigación](docs/MATRIZ_RIESGOS.md):** Análisis de riesgos técnicos, metodológicos, de gestión y cognitivos conforme a las diapositivas 5 a 8.
+* 📊 **[Informe Técnico de Pruebas y Demostraciones (EXP-01 a EXP-06)](docs/INFORME_PRUEBAS_Y_DEMOSTRACIONES.md):** Bitácora experimental exhaustiva con parámetros cuantitativos de red (IPs, puertos, pérdida de paquetes, FPS), latencias, métricas de seguimiento/evasión y lecciones aprendidas de ingeniería.
 * 📦 **Bitácoras de Prototipos por Versión:**
   - **[Prototipo v0.1 (README)](docs/prototipos/v0.1_README.md):** Pipeline base *Sense-Plan-Act*, normalización de tensores y modelado VFH+.
   - **[Prototipo v0.2 (README)](docs/prototipos/v0.2_README.md):** Acoplamiento físico Air 2S + RosettaDrone + MAVSDK, despegue automático y resolución de bloqueos WDAC/OpenCV.

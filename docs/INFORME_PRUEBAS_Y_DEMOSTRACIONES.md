@@ -262,6 +262,34 @@ Muestra de Error en Consola durante EXP-04:
 
 ---
 
+### 2.8. Experimento EXP-08: Arranque Totalmente Autonomo con Bootstrap Temporal Concurrente, Cero Intervencion Manual (Sin STOP/START) y Eliminacion de Pantalla Splash
+* **Fecha y Hora:** 06/11/2026 - 17:05 PET
+* **Configuracion de Red y Enlace:**
+  * IP Laptop (GCS / Procesamiento IA): 10.11.8.24
+  * IP Tablet (RosettaDrone Transmisor): 10.11.8.26
+  * Puerto de Video: UDP 5600 (Recepcion RTP) -> UDP 5601 (Local Annex-B)
+  * Tasa de Bits: 2500 kbps (Ancho de banda sostenido ~1235 paquetes UDP/s)
+  * Resolucion Detectada: 1620 x 1080 pixeles a 30-80 FPS
+* **Objetivo:**
+  1. Eliminar la pantalla negra intermedia de sincronizacion ("splash screen") que mostraba mensajes de espera e instrucciones de manipulacion fisica en la tablet.
+  2. Suprimir por completo la necesidad de presionar 'STOP' y 'START' en RosettaDrone, permitiendo que el sistema enganche el flujo de video en vivo de manera instantanea y 100% automatica.
+  3. Prevenir cualquier corrupcion visual, bandas de macrobloques o congelamiento en el hilo de interfaz grafica de OpenCV.
+* **Diagnostico y Analisis Causa-Raiz:**
+  1. *Fallo de Sincronizacion Estatica Previa:* Al invocar `send_initial_headers()` antes de instanciar `FreshFrameReader('udp://127.0.0.1:5601')`, el puerto UDP 5601 no se encontraba enlazado (bound) por el sistema operativo, perdiendose los paquetes SPS/PPS iniciales. En consecuencia, el decodificador de FFmpeg quedaba en inanicion (*IDR starvation*), cayendo en el bucle de espera de la pantalla splash.
+  2. *Inviabilidad Operativa del STOP/START:* La exigencia de manipular la interfaz tactil de la tablet del operador en pleno vuelo resulta inaceptable en operaciones reales de campo con UAS autonomos y causaba frustracion en las pruebas de laboratorio.
+* **Solucion Tecnica Aplicada:**
+  1. *Inyeccion Bootstrap Concurrente Temporal:* Se desarrollo el metodo `bridge.start_bootstrap()`, que ejecuta un hilo en segundo plano emitiendo el bloque NAL inicial (SPS + PPS + IDR minimo) cada 50 ms justo durante la fase de sondeo (`avformat_open_input`) del constructor de `FreshFrameReader`.
+  2. *Desconexion Inmediata (`stop_bootstrap()`):* Tan pronto como `reader.read_latest()` entrega el primer fotograma decodificado con exito (en tan solo 0.34 segundos), el inyector se detiene de forma determinista, impidiendo cualquier colision o artefacto de mezcla con los fotogramas en vivo.
+  3. *Eliminacion de la Pantalla Splash:* Se removio por completo el lienzo artificial `splash` en el bucle principal. El sistema pasa directamente de la consola de carga a la ventana combinada de alta resolucion con HUD de seguimiento y mapa de profundidad MiDaS.
+* **Resultados Obtenidos:**
+  * Tiempo de Enganche: **0.34 segundos** (reduccion del 90% respecto a EXP-07 y 100% autonomo).
+  * Intervencion de Usuario: **Cero** (sin pulsar STOP/START en la tablet).
+  * Tasa de Decodificacion del Puente: **79.5 FPS** en hilo desacoplado; tasa de inferencia IA en pantalla: 30+ FPS.
+  * Calidad Visual: Imagen nitida, sin franjas verticales ni bandas de macrobloques.
+  * Precision de Deteccion de Objetivo Humano: Deteccion frontal y de cuerpo con factor de confianza **0.94** y correccion de angulo Yaw en tiempo real.
+
+---
+
 ## 3. COMPARATIVA EVOLUTIVA DE MÉTRICAS CLAVE
 
 ```

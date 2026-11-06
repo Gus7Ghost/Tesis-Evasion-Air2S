@@ -83,6 +83,32 @@ class RTPVideoBridge:
         self.sps = b'\x00\x00\x00\x01\x67\x64\x00\x32\xac\x4d\x00\xcc\x04\x4f\x3c\xb3\x50\x10\x10\x14\x00\x00\x03\x00\x04\x00\x00\x03\x00\xc8\x3c\x70\xca\x80'
         self.pps = b'\x00\x00\x00\x01\x68\xee\x3c\xb0'
 
+        # Cargar secuencia de inicialización rápida (bootstrap IDR)
+        self.bootstrap_nals = []
+        candidates = [
+            "test_raw.h264",
+            os.path.join(os.path.dirname(__file__), "test_raw.h264"),
+            os.path.join(os.path.dirname(__file__), "Air2S_MAVSDK", "test_raw.h264"),
+            os.path.join(os.path.dirname(__file__), "..", "test_raw.h264")
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                try:
+                    with open(c, 'rb') as f:
+                        raw = f.read()
+                    if len(raw) >= 28052:
+                        bootstrap = raw[23016:28052]
+                        nal_indices = [m.start() for m in re.finditer(b'\x00\x00\x00\x01', bootstrap)]
+                        for i, idx in enumerate(nal_indices):
+                            next_idx = nal_indices[i+1] if i+1 < len(nal_indices) else len(bootstrap)
+                            self.bootstrap_nals.append(bootstrap[idx:next_idx])
+                        break
+                except Exception:
+                    pass
+
+        self.boot_running = False
+        self.boot_thread = None
+
         self.s_out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             self.s_out.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
@@ -91,6 +117,25 @@ class RTPVideoBridge:
 
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
+
+    def start_bootstrap(self):
+        """Inicia inyección concurrente del fotograma clave IDR para activar el decodificador de OpenCV."""
+        self.boot_running = True
+        def loop():
+            while self.boot_running:
+                for n in self.bootstrap_nals:
+                    try:
+                        self.s_out.sendto(n, ('127.0.0.1', self.out_port))
+                    except Exception:
+                        pass
+                    time.sleep(0.001)
+                time.sleep(0.05)
+        self.boot_thread = threading.Thread(target=loop, daemon=True)
+        self.boot_thread.start()
+
+    def stop_bootstrap(self):
+        """Detiene inmediatamente la inyección de bootstrap una vez que el decodificador enganchó el stream."""
+        self.boot_running = False
 
     def send_initial_headers(self):
         """Envía ráfaga inicial de SPS/PPS para inicializar el decodificador de OpenCV."""
@@ -194,6 +239,7 @@ class RTPVideoBridge:
 
     def stop(self):
         self.running = False
+        self.boot_running = False
 
 class FreshFrameReader:
     """
@@ -424,11 +470,18 @@ def main():
                 print(f"\n      [!] Recordatorio: RosettaDrone debe tener 'Enable video feed' ON enviando a {local_ip}:5600 (Bitrate: 2500 kbps).")
             
         print(f"\n    [OK] ¡Flujo de video del dron detectado! ({bridge.packet_count} paquetes)")
-        print("[*] Sincronizando cabeceras H.264 e iniciando decodificador (Zero-Latency)...")
-        print("[!] ACCIÓN EN LA TABLET: En RosettaDrone pulsa 'STOP' y luego 'START'")
-        print("    (o en Ajustes confirma 'Video bitrate' en 2500 kbps) para emitir el fotograma clave.\n")
-        bridge.send_initial_headers()
+        print("[*] Sincronizando flujo de video e iniciando decodificador (Zero-Latency)...")
+        bridge.start_bootstrap()
         reader = FreshFrameReader('udp://127.0.0.1:5601')
+
+        # Sincronizar decodificador automáticamente sin requerir ninguna acción en la tablet
+        t_boot = time.time()
+        while time.time() - t_boot < 4.0:
+            ret, _ = reader.read_latest()
+            if ret:
+                break
+            time.sleep(0.05)
+        bridge.stop_bootstrap()
     else:
         print(f"\n[*] Abriendo camara web integrada (Dispositivo {args.cam})...")
         reader = FreshFrameReader(args.cam)
@@ -498,20 +551,8 @@ def main():
             if not paused:
                 ret, frame = reader.read_latest()
                 if not ret or frame is None:
-                    # Mostrar pantalla de sincronización interactiva en lugar de ventana gris vacía
-                    splash = np.zeros((540, 1280, 3), dtype=np.uint8)
-                    splash[:] = (30, 30, 30)
-                    cv2.putText(splash, "TESIS UNI - SISTEMA DE PERSECUCION Y PROFUNDIDAD", (180, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 220, 255), 2)
-                    cv2.putText(splash, "Sincronizando flujo de video H.264 de la camara...", (260, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.70, (255, 255, 255), 2)
-                    
-                    if args.drone and bridge:
-                        cv2.putText(splash, f"Paquetes UDP recibidos de RosettaDrone: {bridge.packet_count}", (310, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
-                        cv2.putText(splash, "Esperando fotograma clave (IDR)...", (400, 310), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 220, 255), 2)
-                        cv2.putText(splash, "--> EN LA TABLET: Pulsa 'STOP' y luego 'START' en RosettaDrone <--", (160, 380), cv2.FONT_HERSHEY_SIMPLEX, 0.70, (0, 255, 255), 2)
-                        cv2.putText(splash, "(o en Ajustes confirma el bitrate en 2500 kbps para iniciar)", (260, 420), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
-                    
-                    cv2.imshow(win_name, splash)
-                    key = cv2.waitKey(20) & 0xFF
+                    # Procesar eventos de interfaz y esperar al siguiente cuadro
+                    key = cv2.waitKey(5) & 0xFF
                     if key == ord('q') or key == 27:
                         break
                     continue

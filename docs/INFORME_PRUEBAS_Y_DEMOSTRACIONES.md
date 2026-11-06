@@ -234,13 +234,42 @@ Muestra de Error en Consola durante EXP-04:
 
 ---
 
+### 2.7. Experimento EXP-07: Depuración de Imagen Fantasma Histórica (Sillas) y Eliminación de Macrobloques por Desincronización de Parámetros H.264
+* **Fecha y Hora:** 06/11/2026 - 15:40 PET
+* **Configuración de Red y Enlace:**
+  * IP Laptop (GCS / Procesamiento IA): 10.11.8.24
+  * IP Tablet (RosettaDrone Transmisor): 10.11.8.37
+  * Puerto de Video: UDP 5600 (Recepción RTP) -> UDP 5601 (Local Annex-B)
+  * Tasa de Bits: 2500 kbps (Configuración óptima confirmada para DJI Air 2S)
+  * Resolución Detectada: 1620 x 1080 píxeles (Formato nativo 3:2 del sensor de cámara)
+* **Objetivo:**
+  1. Erradicar la superposición de imágenes históricas grabadas anteriormente (patas de sillas de oficina de 	est_raw.h264) sobre el video en vivo.
+  2. Eliminar las bandas verticales de macrobloques pixelados y las pantallas verdes intermitentes causadas por fallos en el decodificador H.264.
+  3. Restablecer la detección continua de personas con MediaPipe (Target: Humano) y la estimación de profundidad con MiDaS.
+* **Diagnóstico y Análisis Causa-Raíz:**
+  1. *Mezcla de Imagen Fantasma:* En un intento previo de acelerar la conexión, se inyectaron cuadros clave del archivo 	est_raw.h264 (grabado el 3 de noviembre apuntando al piso del laboratorio). Dado que el códec del DJI Air 2S opera con *Periodic Intra Refresh* (PIR) en lugar de cuadros IDR masivos, las áreas estáticas de fondo no se refrescaban, haciendo que la imagen antigua persistiera indefinidamente y el tracker fijara falsamente una pata de silla como un humano con 94% de certeza.
+  2. *Pantalla Verde y illegal memory management control operation 32:* La inyección periódica de SPS/PPS cada 30 rebanadas en medio de un flujo P-frame violaba la norma ITU-T H.264 (sección 7.4.1.2), invalidando los conjuntos de parámetros de imagen en FFmpeg y corrompiendo la lista de referencia del búfer de imágenes decodificadas (DPB).
+  3. *Distorsión Vertical en Franjas:* Al no verificar los números de secuencia RTP en los fragmentos FU-A, las pérdidas normales de paquetes en el enlace Wi-Fi provocaban que fragmentos incompletos se entregaran al decodificador, rompiendo la entropía CABAC y corrompiendo los vectores de movimiento de los macrobloques.
+* **Solución Técnica Aplicada:**
+  1. Eliminación radical de cualquier cuadro pregrabado o sintetizado de 	est_raw.h264.
+  2. Inyección de las cabeceras SPS/PPS única y exclusivamente al abrir el flujo (ráfaga de 3 paquetes iniciales), sin reinyectar jamás a mitad de cuadro.
+  3. Implementación de filtro de integridad RTP: si se detecta un salto en la secuencia (seq != (last_seq + 1) & 0xFFFF), la rebanada FU-A se descarta limpiamente para que FFmpeg aplique ocultamiento de errores sin corromper el búfer.
+* **Resultados Obtenidos:**
+  * Calidad de Video: Imagen 100% nítida, sin pixelación, sin bandas verticales y sin fantasmas (verificado en live_continuous_60.jpg y live_continuous_120.jpg).
+  * Rendimiento de Cuadros: 276 cuadros capturados en 8 segundos (34.5 FPS sostenidos).
+  * Rastreo de Objetivo Humano: Detección facial y corporal perfecta con confianza de 0.94 y cálculo de guiñada Yaw: -1.0 deg [AL FRENTE].
+  * Mapa de Profundidad MiDaS: Estimación continua y limpia en escala INFERNO sin saturación ni ruido de macrobloques.
+
+---
+
 ## 3. COMPARATIVA EVOLUTIVA DE MÉTRICAS CLAVE
 
 ```
                     TIEMPO DE ENGANCHE DE VIDEO (s)
 EXP-03 (Sin Hilos)       |==================================== > 30.0 s (Timeout)
 EXP-05 (IDR Starvation)  |==================================== > 30.0 s (Bloqueo)
-EXP-06 (Bootstrap IDR)   |== 0.47 s (¡Arranque Instantáneo!)
+EXP-06 (Bootstrap Chair) |== 0.47 s (Arranque rápido pero con fantasma)
+EXP-07 (Limpio + Filtro) |=== 3.61 s (¡Arranque 100% Real y Nítido!)
 
                     LATENCIA DE VIDEO PROMEDIO (ms)
 EXP-03 (Monohilo)        |==================================== > 25,000 ms
@@ -251,6 +280,7 @@ EXP-06 (Zero-Latency)    |=== 120 - 150 ms (¡Tiempo Real Fluido!)
 EXP-03 (Saturado)        |= 1.5 FPS
 EXP-04 (Intermedio)      |=============== 15.0 FPS
 EXP-06 (Optimizado)      |============================ 27.9 FPS
+EXP-07 (Limpio 34.5 FPS) |================================== 34.5 FPS
 ```
 
 ---

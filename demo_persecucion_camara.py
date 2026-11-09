@@ -249,7 +249,12 @@ class FreshFrameReader:
     Elimina por completo la acumulacion de latencia y los bloqueos "(No responde)".
     """
     def __init__(self, src_uri):
-        self.cap = cv2.VideoCapture(src_uri, cv2.CAP_FFMPEG)
+        if isinstance(src_uri, int):
+            self.cap = cv2.VideoCapture(src_uri, cv2.CAP_DSHOW)
+            if not self.cap.isOpened():
+                self.cap = cv2.VideoCapture(src_uri)
+        else:
+            self.cap = cv2.VideoCapture(src_uri, cv2.CAP_FFMPEG)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.latest_frame = None
         self.has_new_frame = False

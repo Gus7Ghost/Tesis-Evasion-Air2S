@@ -21,6 +21,8 @@ En cumplimiento estricto con los lineamientos metodológicos de la **Semana 07 (
   - **[Prototipo v0.1 (README)](docs/prototipos/v0.1_README.md):** Pipeline base *Sense-Plan-Act*, normalización de tensores y modelado VFH+.
   - **[Prototipo v0.2 (README)](docs/prototipos/v0.2_README.md):** Acoplamiento físico Air 2S + RosettaDrone + MAVSDK, despegue automático y resolución de bloqueos WDAC/OpenCV.
   - **[Prototipo v0.3 (README)](docs/prototipos/v0.3_README.md):** Máquina de Estados Finitos (FSM), HUD interactivo, telemetría y diagnósticos de red.
+  - **[Prototipo v1.0 Master (Semana 10)](docs/prototipos/v1.0_README.md):** Navegación autónoma a 1.50 m, persecución activa de personas, evasión reactiva con MiDaS v2.1, freno de emergencia dinámico y decodificador instantáneo H.264 (28 ms).
+* 📈 **[Gráficos de Validación a 300 DPI y Métricas](docs/graficos_tesis/tabla_metricas_tesis.md):** Curvas de convergencia de altitud, perfiles de evasión lateral, tracking angular yaw y latencia end-to-end.
 
 ---
 
@@ -76,8 +78,8 @@ Cada prototipo posee su propia carpeta con **código fuente ejecutable y su resp
 | :---: | :--- | :---: | :---: |
 | **`v0.1`** | Diseño modular del pipeline, VFH+ inicial y corrección de disparidad monocular. | Completado | [📁 Ver Código y README v0.1](prototipos/v0.1/) |
 | **`v0.2`** | Integración física con DJI Air 2S, MAVSDK 3.17, bypass de WDAC con HOG y despegue probado. | Completado | [📁 Ver Código y README v0.2](prototipos/v0.2/) |
-| **`v0.3`** | Implementación de FSM, logging de métricas para tesis a 30 Hz y script de diagnóstico RTSP. | **En curso / Actual** | [📁 Ver Código y README v0.3](prototipos/v0.3/) |
-| **`v1.0`** | Fine-tuning con dataset urbano de postes/árboles (IDD) y validación en exteriores. | Planificado | - |
+| **`v0.3`** | Implementación de FSM, logging de métricas para tesis a 30 Hz y script de diagnóstico RTSP. | Completado | [📁 Ver Código y README v0.3](prototipos/v0.3/) |
+| **`v1.0`** | **Prototipo Completo:** Ascenso a 1.5m, persecución visual humana, evasión reactiva MiDaS, freno de seguridad y bootstrap H.264 instantáneo. | **Completado / Validado** | [📁 Ver Prototipo v1.0](prototipo_completo_tesis.py) \| [Manual](docs/prototipos/v1.0_README.md) |
 
 ---
 
@@ -109,21 +111,38 @@ network:
   video_stream_uri: "rtsp://192.168.43.54:8554/fpv" # IP de la Tablet con RosettaDrone
 ```
 
-### Ejecución:
-* **Demostración en Vivo en Pantalla Dividida (Persecución + Estimación MiDaS en Tiempo Real):**
-  - Con Cámara Web Local:
-    ```bash
-    python demo_persecucion_camara.py
-    ```
-  - Con Cámara del Dron DJI Air 2S (vía RosettaDrone UDP 5600, Motores Apagados):
-    ```bash
-    python demo_persecucion_camara.py --drone
-    ```
-* **Prueba aislada de cámara (Sin motores):**
+### Ejecución de Prototipos:
+* **🚀 Prototipo Completo Maestro de Tesis (Vuelo Real con Motores Activos a 1.50 m):**
   ```bash
-  python test_video.py
+  python prototipo_completo_tesis.py --drone --fly
   ```
-* **Bucle completo de vuelo autónomo:**
+  *(Opcional: `--auto-takeoff` para despegue programado tras cuenta regresiva de 3 s)*
+
+* **💻 Modo Seguro en Tierra (Cámara y Sensores Activos sin Encender Hélices):**
   ```bash
-  python main.py
+  python prototipo_completo_tesis.py --drone
+  ```
+
+* **📹 Modo Simulación Local (Webcam de la Laptop):**
+  ```bash
+  python prototipo_completo_tesis.py --webcam
+  ```
+
+* **🎮 Teclas de Control Interactivo en Vuelo (Ventana OpenCV o Consola):**
+  - **`[T]`** : Despegue y ascenso automático controlado a 1.50 metros.
+  - **`[O]`** : Alternar modo *Offboard* (Ceder / Tomar control autónomo por IA).
+  - **`[ESPACIO]`** : **FRENO DE EMERGENCIA** / Hover instantáneo.
+  - **`[L]`** : Aterrizaje seguro inmediato.
+  - **`[Q]`** : Aterrizaje y salida ordenada del sistema.
+
+### Herramientas de Análisis Científico y Gráficos:
+* **📊 Generación de Gráficos de Tesis a 300 DPI y Tabla de Métricas:**
+  ```bash
+  python generar_graficos_tesis.py
+  ```
+  *(Genera `docs/graficos_tesis/figura_1_convergencia_altitud_1.5m.png`, `figura_2_evasion_reactiva_obstaculos.png`, `figura_3_persecucion_humano_yaw.png` y `figura_4_rendimiento_fps_latencia.png`)*
+
+* **📑 Generación de Informe Word APA 7 (Semana 10 - Fiabilidad y Validez):**
+  ```bash
+  python generar_informe_semana10_docx.py
   ```

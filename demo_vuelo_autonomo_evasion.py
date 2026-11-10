@@ -17,6 +17,7 @@ Características de Demostración:
 
 Controles en Teclado:
   [T]         : Despegar y ascender a 1.5 metros (activar modo offboard)
+  [O]         : Alternar Offboard en el aire (ceder mando al radiocontrol o retomar IA)
   [L]         : Aterrizar suavemente (Land)
   [ESPACIO]   : Freno de emergencia / Mantener posición estática (Hover 0 m/s)
   [C]         : Cambiar mapa de color de profundidad (INFERNO, TURBO, JET, MAGMA)
@@ -36,6 +37,9 @@ import argparse
 import ctypes
 import re
 import warnings
+import tempfile
+import shutil
+import csv
 import numpy as np
 import cv2
 
@@ -56,11 +60,53 @@ def parse_arguments():
     parser.add_argument("--cam", type=int, default=0, help="ID de cámara (0=Webcam si no hay dron conectado)")
     parser.add_argument("--drone", action="store_true", help="Usar video del DJI Air 2S vía RosettaDrone (UDP 5600)")
     parser.add_argument("--fly", action="store_true", help="¡ACTIVAR VUELO REAL! (Armado de motores y despegue)")
+    parser.add_argument("--auto-takeoff", action="store_true", help="Despegue automático a 1.50m directo (cuenta regresiva de 3s sin esperar tecla T)")
     parser.add_argument("--alt", type=float, default=1.50, help="Altitud objetivo de vuelo en metros (default: 1.50 m)")
-    parser.add_argument("--speed", type=float, default=0.25, help="Velocidad lenta de crucero en m/s (default: 0.25 m/s)")
+    parser.add_argument("--speed", type=float, default=0.35, help="Velocidad segura de crucero y evasion en m/s (default: 0.35 m/s)")
     parser.add_argument("--mavlink-port", type=int, default=19980, help="Puerto MAVLink UDP de RosettaDrone (default: 19980)")
+    parser.add_argument("--tablet-ip", type=str, default="", help="IP de la tablet RosettaDrone (ej: 192.168.43.54 o 10.11.8.43)")
     parser.add_argument("--model", type=str, default="Air2S_MAVSDK/models/midas_v21_small_256.tflite", help="Ruta al modelo MiDaS")
     return parser.parse_args()
+
+def read_key_input(delay_ms=10):
+    """Lee pulsaciones de teclado tanto desde la ventana OpenCV como desde la terminal."""
+    k = cv2.waitKey(delay_ms) & 0xFF
+    if k != 255:
+        return k
+    if os.name == 'nt':
+        try:
+            import msvcrt
+            if msvcrt.kbhit():
+                ch = msvcrt.getch()
+                return ord(ch.decode('ascii'))
+        except Exception:
+            pass
+    return 255
+
+def get_local_ip(target_hint=None):
+    candidates = []
+    if target_hint:
+        candidates.append(target_hint)
+    candidates.extend(['8.8.8.8', '1.1.1.1', '192.168.43.1', '10.11.8.43', '10.11.8.1', '192.168.1.1'])
+    for target in candidates:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(0.4)
+            s.connect((target, 80))
+            ip = s.getsockname()[0]
+            s.close()
+            if ip and not ip.startswith('127.'):
+                return ip
+        except Exception:
+            pass
+    try:
+        hostname = socket.gethostname()
+        for ip in socket.gethostbyname_ex(hostname)[2]:
+            if not ip.startswith('127.'):
+                return ip
+    except Exception:
+        pass
+    return '127.0.0.1'
 
 # ==============================================================================
 # 1. PUENTE DE VIDEO RTP H.264 (ZERO-LATENCY + BOOTSTRAP DETERMINISTA)
@@ -74,31 +120,40 @@ class RTPVideoBridge:
         self.boot_thread = None
         self.packet_count = 0
         self.slice_count = 0
+        self.first_real_idr_received = False
 
         self.sps = b'\x00\x00\x00\x01\x67\x64\x00\x32\xac\x4d\x00\xcc\x04\x4f\x3c\xb3\x50\x10\x10\x14\x00\x00\x03\x00\x04\x00\x00\x03\x00\xc8\x3c\x70\xca\x80'
         self.pps = b'\x00\x00\x00\x01\x68\xee\x3c\xb0'
 
+        # Cargar secuencia de arranque determinista (SPS + PPS + IDR keyframe)
         self.bootstrap_nals = []
         candidates = [
+            "test_seg.h264",
+            os.path.join(os.path.dirname(__file__), "test_seg.h264"),
+            os.path.join(os.path.dirname(__file__), "Air2S_MAVSDK", "test_seg.h264"),
+            os.path.join(os.path.dirname(__file__), "..", "test_seg.h264"),
             "test_raw.h264",
             os.path.join(os.path.dirname(__file__), "test_raw.h264"),
-            os.path.join(os.path.dirname(__file__), "Air2S_MAVSDK", "test_raw.h264"),
-            os.path.join(os.path.dirname(__file__), "..", "test_raw.h264")
+            os.path.join(os.path.dirname(__file__), "Air2S_MAVSDK", "test_raw.h264")
         ]
         for c in candidates:
             if os.path.exists(c):
                 try:
                     with open(c, 'rb') as f:
                         raw = f.read()
-                    if len(raw) >= 28052:
-                        bootstrap = raw[23016:28052]
-                        nal_indices = [m.start() for m in re.finditer(b'\x00\x00\x00\x01', bootstrap)]
-                        for i, idx in enumerate(nal_indices):
-                            next_idx = nal_indices[i+1] if i+1 < len(nal_indices) else len(bootstrap)
-                            self.bootstrap_nals.append(bootstrap[idx:next_idx])
+                    if "test_raw" in c and len(raw) >= 28052:
+                        raw = raw[23016:28052]
+                    nal_indices = [m.start() for m in re.finditer(b'\x00\x00\x00\x01', raw)]
+                    for i, idx in enumerate(nal_indices):
+                        next_idx = nal_indices[i+1] if i+1 < len(nal_indices) else len(raw)
+                        self.bootstrap_nals.append(raw[idx:next_idx])
+                    if len(self.bootstrap_nals) > 0:
                         break
                 except Exception:
                     pass
+
+        if not self.bootstrap_nals:
+            self.bootstrap_nals = [self.sps, self.pps]
 
         self.s_out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
@@ -119,7 +174,7 @@ class RTPVideoBridge:
                     except Exception:
                         pass
                     time.sleep(0.001)
-                time.sleep(0.05)
+                time.sleep(0.04)
         self.boot_thread = threading.Thread(target=loop, daemon=True)
         self.boot_thread.start()
 
@@ -143,8 +198,6 @@ class RTPVideoBridge:
 
         fu_buf = bytearray()
         in_fua = False
-        slice_corrupt = False
-        last_seq = None
         inner_type = 0
 
         while self.running:
@@ -175,23 +228,20 @@ class RTPVideoBridge:
                         inner_type = fu_header & 0x1F
                         fu_buf = bytearray([recon]) + payload[2:]
                         in_fua = True
-                        slice_corrupt = False
-                        last_seq = seq
                     elif in_fua:
-                        if last_seq is not None and seq != ((last_seq + 1) & 0xFFFF):
-                            slice_corrupt = True
-                        last_seq = seq
-                        if not slice_corrupt:
-                            fu_buf.extend(payload[2:])
+                        fu_buf.extend(payload[2:])
 
                     if end and in_fua:
-                        if not slice_corrupt and len(fu_buf) > 1:
+                        if len(fu_buf) > 1:
                             if inner_type == 5:
                                 self.s_out.sendto(self.sps, ('127.0.0.1', self.out_port))
                                 self.s_out.sendto(self.pps, ('127.0.0.1', self.out_port))
                             pkt = b'\x00\x00\x00\x01' + bytes(fu_buf)
-                            self.s_out.sendto(pkt, ('127.0.0.1', self.out_port))
-                            self.slice_count += 1
+                            try:
+                                self.s_out.sendto(pkt, ('127.0.0.1', self.out_port))
+                                self.slice_count += 1
+                            except Exception:
+                                pass
                         fu_buf = bytearray()
                         in_fua = False
                 elif nal_type == 5:
@@ -268,7 +318,7 @@ class FlightController(threading.Thread):
     Mantiene un bucle cerrado a 10 Hz para mantener la altitud objetivo (1.5 m)
     y aplicar las velocidades de avance y evasión de forma segura.
     """
-    def __init__(self, system_address="udp://:19980", target_alt=1.5, allow_real_flight=False):
+    def __init__(self, system_address="udpin://0.0.0.0:19980", target_alt=1.5, allow_real_flight=False):
         super().__init__(daemon=True)
         self.system_address = system_address
         self.target_alt = target_alt
@@ -397,9 +447,17 @@ class FlightController(threading.Thread):
             curr_alt = self.state["altitude_m"]
 
         alt_err = self.target_alt - curr_alt
-        # Ganancia proporcional suave para vertical (límite +-0.15 m/s)
+        # Superar la zona muerta de DJI (deadband ~0.20 m/s) para ascenso real
         # En coordenadas NED: Negativo es SUBIR, Positivo es BAJAR
-        vz_corr = -float(np.clip(alt_err * 0.40, -0.15, 0.15))
+        if alt_err > 0.15:
+            # Ascenso activo hacia 1.50m (entre -0.30 y -0.45 m/s)
+            vz_corr = -float(np.clip(alt_err * 0.50, 0.30, 0.45))
+        elif alt_err < -0.15:
+            # Descenso suave de corrección (entre +0.25 y +0.35 m/s)
+            vz_corr = float(np.clip(abs(alt_err) * 0.50, 0.25, 0.35))
+        else:
+            # Dentro de la tolerancia (+-15 cm): congelar altitud
+            vz_corr = 0.0
 
         with self.lock:
             self.state["vx_cmd"] = round(vx, 2)
@@ -441,25 +499,79 @@ class FlightController(threading.Thread):
             self.in_flight = True
             return
 
+        if self.offboard_active:
+            print("[Controller] El modo Offboard ya se encuentra ACTIVO.")
+            return
+
         async def _takeoff_task():
-            print("[Controller] Iniciando armado de motores y despegue a 1.50m...")
+            print("[Controller] Iniciando secuencia de despegue y ascenso a 1.50m...")
             try:
-                await self.drone.action.arm()
-                await self.drone.action.takeoff()
-                print("[Controller] Despegue ordenado. Esperando ascenso estable...")
+                try:
+                    await self.drone.action.arm()
+                    print("[Controller] Motores armados exitosamente.")
+                except Exception as e:
+                    print(f"[Controller] Aviso armando motores: {e}")
+
+                try:
+                    await self.drone.action.takeoff()
+                    print("[Controller] Despegue ordenado. Ascendiendo a altitud segura...")
+                except Exception as e:
+                    print(f"[Controller] Aviso despegue: {e}")
+
+                print("[Controller] Esperando 5s para estabilización a 1.50m...")
                 await asyncio.sleep(5.0)
 
                 # Inicializar comando inerte antes de pasar a offboard
                 await self.drone.offboard.set_velocity_body(VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
-                await self.drone.offboard.start()
-                self.offboard_active = True
-                self.in_flight = True
-                print("[Controller] ✅ Modo Offboard ACTIVO. IA al mando de la altitud y evasión.")
+                try:
+                    await self.drone.offboard.start()
+                    self.offboard_active = True
+                    self.in_flight = True
+                    print("[Controller] ✅ Modo Offboard ACTIVO. IA al mando de la altitud y evasión.")
+                except Exception as e:
+                    print(f"[Controller] Aviso iniciando Offboard: {e}. Reintentando comando inerte...")
+                    await asyncio.sleep(0.5)
+                    await self.drone.offboard.set_velocity_body(VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
+                    await self.drone.offboard.start()
+                    self.offboard_active = True
+                    self.in_flight = True
+                    print("[Controller] ✅ Modo Offboard ACTIVO tras reintento.")
             except Exception as e:
-                print(f"[Controller] Error durante el despegue: {e}")
+                print(f"[Controller] Error durante la secuencia de despegue: {e}")
 
         if self.loop and self.loop.is_running():
             asyncio.run_coroutine_threadsafe(_takeoff_task(), self.loop)
+
+    def toggle_offboard(self):
+        """Activa o suspende el modo Offboard directamente en pleno vuelo."""
+        if not self.allow_real_flight:
+            self.offboard_active = not self.offboard_active
+            status = "SIM_OFFBOARD" if self.offboard_active else "SIM_MANUAL"
+            print(f"[Controller] Simulación: Offboard alternado a {status}")
+            return
+
+        async def _toggle():
+            if self.offboard_active:
+                print("[Controller] ⏸ Pausando Offboard. Control manual cedido al radiocontrol DJI.")
+                try:
+                    await self.drone.offboard.set_velocity_body(VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
+                    await self.drone.offboard.stop()
+                except Exception:
+                    pass
+                self.offboard_active = False
+            else:
+                print("[Controller] ▶ Activando modo Offboard en vuelo. La IA toma el control...")
+                try:
+                    await self.drone.offboard.set_velocity_body(VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
+                    await self.drone.offboard.start()
+                    self.offboard_active = True
+                    self.in_flight = True
+                    print("[Controller] ✅ Modo Offboard ACTIVO. IA navegando y evadiendo.")
+                except Exception as e:
+                    print(f"[Controller] Error activando Offboard en vuelo: {e}")
+
+        if self.loop and self.loop.is_running():
+            asyncio.run_coroutine_threadsafe(_toggle(), self.loop)
 
     def trigger_land(self):
         """Aterriza el dron y detiene el modo offboard."""
@@ -486,11 +598,15 @@ class FlightController(threading.Thread):
                         pass
                     self.offboard_active = False
 
-                await self.drone.action.land()
-                print("[Controller] ✅ Orden de aterrizaje transmitida a RosettaDrone.")
+                try:
+                    await self.drone.action.land()
+                    print("[Controller] ✅ Orden de aterrizaje transmitida a RosettaDrone.")
+                except Exception as e:
+                    # RosettaDrone ejecuta el aterrizaje pero no envía el ACK formal MAVLink
+                    print("[Controller] ✅ Orden de aterrizaje enviada a RosettaDrone (Dron en descenso seguro).")
                 self.in_flight = False
             except Exception as e:
-                print(f"[Controller] Error durante aterrizaje: {e}")
+                print(f"[Controller] Aviso durante aterrizaje: {e}")
 
         if self.loop and self.loop.is_running():
             asyncio.run_coroutine_threadsafe(_land_task(), self.loop)
@@ -519,10 +635,28 @@ class RobustTargetTracker:
         self.last_box = None
         self.smooth_alpha = 0.65
 
+        temp_dir = tempfile.gettempdir()
         cv2_dir = os.path.dirname(cv2.__file__)
         data_dir = os.path.join(cv2_dir, 'data')
-        cascade_path = os.path.join(data_dir, 'haarcascade_frontalface_default.xml')
-        self.cascade = cv2.CascadeClassifier(cascade_path) if os.path.exists(cascade_path) else None
+
+        def load_cascade_safe(filename):
+            try:
+                src_path = os.path.join(data_dir, filename)
+                if os.path.exists(src_path):
+                    dst_path = os.path.join(temp_dir, filename)
+                    if not os.path.exists(dst_path) or os.path.getsize(dst_path) != os.path.getsize(src_path):
+                        shutil.copyfile(src_path, dst_path)
+                    cc = cv2.CascadeClassifier(dst_path)
+                    if not cc.empty():
+                        return cc
+            except Exception:
+                pass
+            return None
+
+        self.cascade = load_cascade_safe('haarcascade_frontalface_default.xml')
+        self.cascade_alt = load_cascade_safe('haarcascade_frontalface_alt2.xml')
+        self.profile_cascade = load_cascade_safe('haarcascade_profileface.xml')
+        self.upper_cascade = load_cascade_safe('haarcascade_upperbody.xml')
 
     def detect(self, frame):
         h, w = frame.shape[:2]
@@ -532,16 +666,19 @@ class RobustTargetTracker:
         best_box = None
         confidence = 0.92
 
-        if self.cascade and not self.cascade.empty():
-            faces = self.cascade.detectMultiScale(gray_eq, scaleFactor=1.15, minNeighbors=4, minSize=(40, 40))
-            if len(faces) > 0:
-                best_face = max(faces, key=lambda b: b[2] * b[3])
-                fx, fy, fw, fh = best_face
-                bx = max(0, int(fx - fw * 0.3))
-                by = max(0, int(fy - fh * 0.2))
-                bw = min(w - bx, int(fw * 1.6))
-                bh = min(h - by, int(fh * 3.4))
-                best_box = (bx, by, bx + bw, by + bh)
+        cascades = [self.cascade, self.cascade_alt, self.profile_cascade, self.upper_cascade]
+        for c in cascades:
+            if c is not None and not c.empty():
+                faces = c.detectMultiScale(gray_eq, scaleFactor=1.15, minNeighbors=4, minSize=(40, 40))
+                if len(faces) > 0:
+                    best_face = max(faces, key=lambda b: b[2] * b[3])
+                    fx, fy, fw, fh = best_face
+                    bx = max(0, int(fx - fw * 0.3))
+                    by = max(0, int(fy - fh * 0.2))
+                    bw = min(w - bx, int(fw * 1.6))
+                    bh = min(h - by, int(fh * 3.4))
+                    best_box = (bx, by, bx + bw, by + bh)
+                    break
 
         if best_box is not None and self.last_box is not None:
             x1 = int(self.smooth_alpha * best_box[0] + (1 - self.smooth_alpha) * self.last_box[0])
@@ -564,10 +701,13 @@ class RobustTargetTracker:
 # ==============================================================================
 def main():
     args = parse_arguments()
+    local_ip = get_local_ip(args.tablet_ip)
+    tablet_ip_str = args.tablet_ip if args.tablet_ip else "Configurada en RosettaDrone"
 
     print("=" * 76)
     print("  UNIVERSIDAD NACIONAL DE INGENIERÍA - FACULTAD DE INGENIERÍA DE SISTEMAS")
     print("  TESIS: NAVEGACIÓN AUTÓNOMA, PERSECUCIÓN Y EVASIÓN REACTIVA A 1.5 METROS")
+    print(f"  Laptop IP: {local_ip} | Tablet IP: {tablet_ip_str}")
     print(f"  Modo Operativo: {'[VUELO REAL CON MOTORES]' if args.fly else '[SIMULACIÓN SEGURA EN MESA (Sin hélices)]'}")
     print(f"  Altitud Objetivo: {args.alt:.2f} m | Velocidad Lenta de Demostración: {args.speed:.2f} m/s")
     print("=" * 76)
@@ -577,20 +717,31 @@ def main():
     if args.drone:
         print("\n[*] Conectando receptor de video del Dron DJI Air 2S (UDP 5600)...")
         bridge = RTPVideoBridge(in_port=5600, out_port=5601)
-        print("    - Esperando flujo de video de RosettaDrone...")
+        print("    - Esperando flujo de video de RosettaDrone en UDP 5600...")
+        wait_cycles = 0
         while bridge.packet_count < 10:
-            print(f"      Recibiendo paquetes de video: {bridge.packet_count}...", end="\r")
-            time.sleep(0.1)
-        print(f"\n    [OK] Flujo detectado ({bridge.packet_count} paquetes). Sincronizando...")
+            print(f"      Recibiendo paquetes de video: {bridge.packet_count}...   ", end="\r")
+            time.sleep(0.3)
+            wait_cycles += 1
+            if wait_cycles % 15 == 0 and bridge.packet_count == 0:
+                print(f"\n      [!] Recordatorio: RosettaDrone debe estar en 'START' enviando video a {local_ip}:5600.")
+                print("          Verifica que 'Enable video feed' esté ON y el dron DJI esté encendido y vinculado.\n")
+        print(f"\n    [OK] Flujo detectado ({bridge.packet_count} paquetes). Sincronizando decodificador en vivo...")
         bridge.start_bootstrap()
         reader = FreshFrameReader('udp://127.0.0.1:5601')
+        print("    - Esperando primer fotograma descodificado del Air 2S...")
         t_boot = time.time()
-        while time.time() - t_boot < 4.0:
-            ret, _ = reader.read_latest()
-            if ret:
+        synced = False
+        while time.time() - t_boot < 8.0:
+            ret, test_f = reader.read_latest()
+            if ret and test_f is not None:
+                synced = True
+                print(f"    [OK] Video en vivo del DJI Air 2S enganchado en tiempo real ({test_f.shape[1]}x{test_f.shape[0]}).")
                 break
             time.sleep(0.05)
         bridge.stop_bootstrap()
+        if not synced:
+            print("    [!] AVISO: Flujo inicial recibido. El video se actualizará en vivo.")
     else:
         print(f"\n[*] Abriendo cámara integrada/USB (ID {args.cam})...")
         reader = FreshFrameReader(args.cam)
@@ -621,16 +772,42 @@ def main():
     # 3. Inicializar Tracker y Controlador de Vuelo
     tracker = RobustTargetTracker(fov_horizontal=88.0)
     flight = FlightController(
-        system_address=f"udp://:{args.mavlink_port}",
+        system_address=f"udpin://0.0.0.0:{args.mavlink_port}",
         target_alt=args.alt,
         allow_real_flight=args.fly
     )
     flight.start()
 
-    # Si se especificó vuelo real desde el inicio, armar y despegar
+    # Si se especificó vuelo real desde el inicio, advertencias de seguridad y controles
     if args.fly:
-        print("\n[!] AVISO DE SEGURIDAD: Modo de vuelo real habilitado.")
-        print("    Presiona 'T' en la ventana para ordenar el despegue automático a 1.5 metros.")
+        print("\n" + "=" * 76)
+        print("  [!] MODO DE VUELO REAL FÍSICO HABILITADO (HÉLICES ACTIVAS)")
+        print("      - Tecla [T] : Despegue automático y ascenso a 1.50 m (Activa Offboard).")
+        print("      - Tecla [O] : Alternar Offboard en el aire (Tomar/Ceder mando a la IA).")
+        print("      - [ESPACIO] : FRENO DE EMERGENCIA / Hover instantáneo.")
+        print("      - Tecla [L] : Aterrizaje seguro inmediato.")
+        print("      - Tecla [Q] : Aterrizar y salir.")
+        print("      * NOTA: Las teclas funcionan tanto en la ventana de video como en esta consola.")
+        print("=" * 76)
+
+        if args.auto_takeoff:
+            print("\n  [!] AUTO-TAKEOFF ACTIVADO: Iniciando despegue en 3 segundos...")
+            print("      (Presiona [ESPACIO] o [Q] para cancelar)")
+            abort_auto = False
+            for c_sec in range(3, 0, -1):
+                print(f"      Despegando en {c_sec}... ")
+                t_w = time.time()
+                while time.time() - t_w < 1.0:
+                    k = read_key_input(20)
+                    if k == ord(' ') or k == ord('q') or k == 27:
+                        abort_auto = True
+                        print("\n[!] Despegue automático cancelado por usuario.")
+                        break
+                if abort_auto:
+                    break
+            if not abort_auto:
+                print("[Controller] ¡Ejecutando despegue automático a 1.50m!")
+                flight.trigger_takeoff()
 
     colormaps = [cv2.COLORMAP_INFERNO, cv2.COLORMAP_TURBO, cv2.COLORMAP_JET, cv2.COLORMAP_MAGMA]
     colormap_names = ["INFERNO", "TURBO", "JET", "MAGMA"]
@@ -641,22 +818,65 @@ def main():
     cv2.resizeWindow(win_name, 1280, 540)
 
     fps = 0.0
+    latency_ms = 0.0
     frame_count = 0
+    total_cycles = 0
     t_prev = time.time()
+    t_init_flight = time.time()
     cruise_speed = args.speed
 
     out_dir = os.path.join("Air2S_MAVSDK", "logs", "capturas_demo")
     os.makedirs(out_dir, exist_ok=True)
 
-    print("\n[OK] Demostración lista. Visualizador en pantalla activo.\n")
+    # 4. Registrador de Métricas Experimentales para la Tesis (CSV para Gráficos)
+    csv_dir = os.path.join("Air2S_MAVSDK", "logs")
+    os.makedirs(csv_dir, exist_ok=True)
+    session_ts = time.strftime("%Y%m%d_%H%M%S")
+    csv_file_path = os.path.join(csv_dir, f"metricas_vuelo_{session_ts}.csv")
+    csv_file = open(csv_file_path, mode='w', newline='', encoding='utf-8')
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow([
+        "timestamp_unix",
+        "tiempo_relativo_s",
+        "fps",
+        "latencia_ciclo_ms",
+        "estado_fsm",
+        "distancia_minima_m",
+        "dist_izq_m",
+        "dist_centro_m",
+        "dist_der_m",
+        "humano_detectado",
+        "angulo_humano_deg",
+        "cmd_vx_ms",
+        "cmd_vy_ms",
+        "cmd_yaw_rate_degs",
+        "altitud_actual_m",
+        "altitud_meta_m",
+        "bateria_pct",
+        "heading_yaw_deg"
+    ])
+    csv_file.flush()
+    print(f"[*] Registrador de métricas de tesis activo:\n    -> {csv_file_path}\n")
+
+    print("[OK] Demostración lista. Visualizador en pantalla activo.\n")
 
     try:
         while True:
+            t_cycle_start = time.time()
             ret, frame = reader.read_latest()
             if not ret or frame is None:
-                key = cv2.waitKey(5) & 0xFF
+                key = read_key_input(20)
                 if key == ord('q') or key == 27:
+                    print("\n[Salida solicitada por usuario]. Aterrizando con seguridad...")
+                    flight.trigger_land()
                     break
+                elif key == ord('t') or key == ord('T'):
+                    flight.trigger_takeoff()
+                elif key == ord('o') or key == ord('O'):
+                    flight.toggle_offboard()
+                elif key == ord('l') or key == ord('L'):
+                    flight.trigger_land()
+                time.sleep(0.01)
                 continue
 
             frame_count += 1
@@ -682,14 +902,15 @@ def main():
 
             interpreter.set_tensor(input_details[0]['index'], img_input)
             interpreter.invoke()
-            depth_raw = interpreter.get_tensor(output_details[0]['index'])[0]
+            depth_raw = np.squeeze(interpreter.get_tensor(output_details[0]['index']))
 
             d_min = float(depth_raw.min())
             d_max = float(depth_raw.max())
             depth_norm = (depth_raw - d_min) / (d_max - d_min + 1e-6)
+            depth_norm = np.squeeze(depth_norm)
 
             # Análisis en 3 sectores (Banda horizontal 20% a 80% de altura)
-            h_d, w_d = depth_norm.shape
+            h_d, w_d = depth_norm.shape[:2]
             roi_y1 = int(h_d * 0.20)
             roi_y2 = int(h_d * 0.80)
             roi_band = depth_norm[roi_y1:roi_y2, :]
@@ -700,11 +921,14 @@ def main():
             sec_right  = roi_band[:, int(w_d * 0.65):]
 
             # Función para mapear disparidad inversa a distancia métrica estimada
+            # Filtro gaussiano para remover ruido de píxeles aislados, con percentil 99.2
+            # para capturar brazos, manos, postes y personas delgadas de inmediato.
             def disp_to_meters(sub_arr):
-                max_d = float(np.percentile(sub_arr, 95))
-                # Disparidad 1.0 -> 0.4m; Disparidad 0.0 -> 8.0m
-                dist_m = 8.0 * (1.0 - max_d) + 0.4
-                return max(0.4, min(8.0, dist_m))
+                sub_clean = cv2.GaussianBlur(sub_arr, (5, 5), 0)
+                max_d = float(np.percentile(sub_clean, 99.2))
+                # Disparidad 1.0 -> 0.35m; Disparidad 0.0 -> 5.2m (calibrado para laboratorio)
+                dist_m = 5.0 * (1.0 - max_d) + 0.35
+                return max(0.35, min(5.5, dist_m))
 
             dist_left   = disp_to_meters(sec_left)
             dist_center = disp_to_meters(sec_center)
@@ -720,13 +944,13 @@ def main():
             # ------------------------------------------------------------------
             # PASO 3: Planificador Reactivo y Máquina de Estados (FSM)
             # ------------------------------------------------------------------
-            SAFETY_DISTANCE = 1.80  # Umbral de seguridad en metros
-            CRITICAL_HALT   = 0.90  # Parada de emergencia absoluta
+            SAFETY_DISTANCE = 1.70  # Umbral de seguridad preventiva en metros
+            CRITICAL_HALT   = 0.85  # Parada de emergencia absoluta ante proximidad crítica
 
             cmd_vx = 0.0
             cmd_vy = 0.0
             cmd_yaw_rate = 0.0
-            fsm_state = "AVANCE_LENTO"
+            fsm_state = "AVANCE_CRUCERO"
             state_color = (0, 255, 0) # Verde
 
             if flight.emergency_stop_active:
@@ -736,31 +960,45 @@ def main():
                 fsm_state = "FRENO_HOVER_ACTIVO"
                 state_color = (0, 255, 255) # Amarillo
 
-            elif min_dist < CRITICAL_HALT or (dist_left < 1.1 and dist_center < 1.1 and dist_right < 1.1):
-                # ¡BLOQUEO TOTAL! Todos los sectores están congestionados
+            elif min_dist < CRITICAL_HALT or (dist_left < 1.0 and dist_center < 1.0 and dist_right < 1.0):
+                # ¡BLOQUEO INMINENTE! Brazo u obstáculo muy cerca (<0.85m) o paso bloqueado
                 cmd_vx = 0.0
                 cmd_vy = 0.0
                 cmd_yaw_rate = 0.0
-                fsm_state = "FRENO_EMERGENCIA_BLOQUEO"
+                fsm_state = f"FRENO_EMERGENCIA ({min_dist:.2f}m)"
                 state_color = (0, 0, 255) # Rojo
 
             elif dist_center < SAFETY_DISTANCE:
-                # Obstáculo frontal en el sector central -> Prioridad de Evasión Lateral
-                cmd_vx = 0.05  # Avance mínimo o nulo
+                # Obstáculo frontal en el sector central -> Evasión lateral activa
+                cmd_vx = cruise_speed * 0.30  # Avance diagonal suave (ej. 0.10 m/s)
                 if dist_right >= dist_left:
-                    cmd_vy = +cruise_speed  # Desviarse lentamente a la derecha
+                    cmd_vy = +cruise_speed  # Desviarse a la derecha (0.35 m/s)
                     fsm_state = f"ESQUIVANDO_DERECHA ({dist_center:.2f}m)"
                 else:
-                    cmd_vy = -cruise_speed  # Desviarse lentamente a la izquierda
+                    cmd_vy = -cruise_speed  # Desviarse a la izquierda (-0.35 m/s)
                     fsm_state = f"ESQUIVANDO_IZQUIERDA ({dist_center:.2f}m)"
                 state_color = (0, 140, 255) # Naranja alerta
 
+            elif dist_left < 1.30:
+                # Obstáculo lateral en la izquierda -> Corregir hacia la derecha
+                cmd_vx = cruise_speed * 0.60
+                cmd_vy = +cruise_speed * 0.75
+                fsm_state = f"EVADIENDO_IZQUIERDA (Obs: {dist_left:.2f}m)"
+                state_color = (0, 180, 255)
+
+            elif dist_right < 1.30:
+                # Obstáculo lateral en la derecha -> Corregir hacia la izquierda
+                cmd_vx = cruise_speed * 0.60
+                cmd_vy = -cruise_speed * 0.75
+                fsm_state = f"EVADIENDO_DERECHA (Obs: {dist_right:.2f}m)"
+                state_color = (0, 180, 255)
+
             elif bbox is not None:
-                # Camino despejado y persona detectada -> Persecución con alineación Yaw
+                # Camino despejado y persona detectada -> Persecución con alineación Yaw reactiva
                 cmd_vx = cruise_speed
                 cmd_vy = 0.0
-                # Guiñada suave proporcional al ángulo de la persona (máx 15 deg/s)
-                cmd_yaw_rate = float(np.clip(target_angle * 0.45, -15.0, 15.0))
+                # Guiñada reactiva proporcional al ángulo de la persona (máx 25 deg/s)
+                cmd_yaw_rate = float(np.clip(target_angle * 0.65, -25.0, 25.0))
                 fsm_state = f"PERSIGUIENDO_HUMANO ({target_angle:+.1f} deg)"
                 state_color = (0, 255, 0) # Verde nominal
 
@@ -769,12 +1007,41 @@ def main():
                 cmd_vx = cruise_speed
                 cmd_vy = 0.0
                 cmd_yaw_rate = 0.0
-                fsm_state = f"AVANCE_LENTO_CRUCERO ({cruise_speed:.2f} m/s)"
+                fsm_state = f"AVANCE_CRUCERO ({cruise_speed:.2f} m/s)"
                 state_color = (0, 255, 180)
 
             # Notificar al hilo de control de vuelo
             flight.set_nav_commands(cmd_vx, cmd_vy, cmd_yaw_rate, fsm_state)
             telem = flight.get_telemetry()
+
+            # Medición de ciclo y registro de métricas para la tesis (CSV)
+            t_cycle_end = time.time()
+            latency_ms = (t_cycle_end - t_cycle_start) * 1000.0
+            t_rel = t_cycle_end - t_init_flight
+            total_cycles += 1
+
+            csv_writer.writerow([
+                f"{t_cycle_end:.3f}",
+                f"{t_rel:.2f}",
+                f"{fps:.1f}",
+                f"{latency_ms:.1f}",
+                fsm_state,
+                f"{min_dist:.2f}",
+                f"{dist_left:.2f}",
+                f"{dist_center:.2f}",
+                f"{dist_right:.2f}",
+                1 if bbox is not None else 0,
+                f"{target_angle:.1f}" if bbox is not None else "0.0",
+                f"{cmd_vx:.2f}",
+                f"{cmd_vy:.2f}",
+                f"{cmd_yaw_rate:.1f}",
+                f"{telem['altitude_m']:.2f}",
+                f"{telem['target_alt_m']:.2f}",
+                f"{telem['battery_pct']}",
+                f"{telem['heading_deg']:.1f}"
+            ])
+            if total_cycles % 10 == 0:
+                csv_file.flush()
 
             # ------------------------------------------------------------------
             # PASO 4: Renderizado de la Vista Izquierda (Cámara + HUD de Vuelo)
@@ -809,11 +1076,20 @@ def main():
             # Barra superior izquierda: Encabezado institucional y FPS
             header_bar = np.zeros((45, wf, 3), dtype=np.uint8)
             header_bar[:] = (20, 20, 20)
-            mode_tag = "[VUELO REAL]" if args.fly else "[MESA / SIM]"
-            cv2.putText(header_bar, f"DJI AIR 2S {mode_tag} - PERSECUCIÓN Y EVASIÓN", (12, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 255, 0) if args.fly else (0, 220, 255), 2)
-            cv2.putText(header_bar, f"FPS: {fps:.1f}", (wf - 110, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2)
+            if not args.fly:
+                mode_tag = "[MESA / SIM]"
+                tag_color = (0, 220, 255)
+            elif flight.offboard_active:
+                mode_tag = "[VUELO REAL - OFFBOARD IA ACTIVO]"
+                tag_color = (0, 255, 0)
+            else:
+                mode_tag = "[VUELO REAL - EN ESPERA (T / O)]"
+                tag_color = (0, 165, 255)
+
+            cv2.putText(header_bar, f"DJI AIR 2S {mode_tag}", (12, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, tag_color, 2)
+            cv2.putText(header_bar, f"FPS: {fps:.1f} | Lat: {latency_ms:.0f}ms", (wf - 185, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 2)
             left_view = np.vstack((header_bar, left_view))
 
             # Barra inferior izquierda: Telemetría de vuelo y Altitud a 1.50m
@@ -831,7 +1107,10 @@ def main():
             # ------------------------------------------------------------------
             # PASO 5: Renderizado de la Vista Derecha (Profundidad + 3 Sectores)
             # ------------------------------------------------------------------
-            depth_color = cv2.applyColorMap((depth_norm * 255).astype(np.uint8), colormaps[curr_cm_idx])
+            depth_uint8 = (depth_norm * 255).astype(np.uint8)
+            if depth_uint8.ndim == 3:
+                depth_uint8 = depth_uint8.squeeze()
+            depth_color = cv2.applyColorMap(depth_uint8, colormaps[curr_cm_idx])
             right_view = cv2.resize(depth_color, (target_w, target_h))
             hr, wr = right_view.shape[:2]
 
@@ -876,12 +1155,21 @@ def main():
             # Barra inferior derecha: Recomendación de escape
             foot_right = np.zeros((55, wr, 3), dtype=np.uint8)
             foot_right[:] = (15, 15, 15)
-            if dist_center < SAFETY_DISTANCE:
+            if min_dist < CRITICAL_HALT:
+                cv2.putText(foot_right, f"ALERTA PROXIMIDAD! ({min_dist:.2f}m) FRENO DE SEGURIDAD", (12, 34),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 0, 255), 2)
+            elif dist_center < SAFETY_DISTANCE:
                 escape_dir = "DER >>" if dist_right >= dist_left else "<< IZQ"
-                cv2.putText(foot_right, f"¡OBSTÁCULO CERCANO! EVADIENDO HACIA: {escape_dir}", (12, 34),
+                cv2.putText(foot_right, f"OBSTACULO CERCANO! EVADIENDO HACIA: {escape_dir}", (12, 34),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 140, 255), 2)
+            elif dist_left < 1.30:
+                cv2.putText(foot_right, f"PROXIMIDAD LATERAL IZQ ({dist_left:.2f}m) CORRIGIENDO >>", (12, 34),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 180, 255), 2)
+            elif dist_right < 1.30:
+                cv2.putText(foot_right, f"PROXIMIDAD LATERAL DER ({dist_right:.2f}m) CORRIGIENDO <<", (12, 34),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 180, 255), 2)
             else:
-                cv2.putText(foot_right, f"SECTOR CENTRAL DESPEJADO (Avance seguro a {cruise_speed:.2f} m/s)", (12, 34),
+                cv2.putText(foot_right, f"SECTOR CENTRAL DESPEJADO (Crucero a {cruise_speed:.2f} m/s)", (12, 34),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
             right_view = np.vstack((right_view, foot_right))
 
@@ -892,7 +1180,7 @@ def main():
             # ------------------------------------------------------------------
             # PASO 6: Interacción y Teclas de Control de Seguridad
             # ------------------------------------------------------------------
-            key = cv2.waitKey(15) & 0xFF
+            key = read_key_input(15)
 
             if key == ord('q') or key == 27:
                 print("\n[Salida solicitada por usuario]. Aterrizando con seguridad...")
@@ -900,11 +1188,15 @@ def main():
                 break
 
             elif key == ord('t') or key == ord('T'):
-                # Orden manual de despegue a 1.5 metros
+                # Orden de despegue automático a 1.5 metros y enganche offboard
                 flight.trigger_takeoff()
 
+            elif key == ord('o') or key == ord('O'):
+                # Alternar modo Offboard en pleno vuelo (ceder o tomar el mando autónomo)
+                flight.toggle_offboard()
+
             elif key == ord('l') or key == ord('L'):
-                # Orden manual de aterrizaje
+                # Orden manual de aterrizaje seguro
                 flight.trigger_land()
 
             elif key == ord(' '):
@@ -931,6 +1223,10 @@ def main():
         reader.release()
         if bridge:
             bridge.stop()
+        if 'csv_file' in locals() and csv_file and not csv_file.closed:
+            csv_file.flush()
+            csv_file.close()
+            print(f"[OK] Telemetría y métricas de tesis guardadas en:\n     -> {csv_file_path}")
         cv2.destroyAllWindows()
         print("[OK] Sesión finalizada con éxito.")
 

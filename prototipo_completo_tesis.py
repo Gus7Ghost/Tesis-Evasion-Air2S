@@ -127,9 +127,35 @@ class RTPVideoBridge:
         self.sps = b'\x00\x00\x00\x01\x67\x64\x00\x32\xac\x4d\x00\xcc\x04\x4f\x3c\xb3\x50\x10\x10\x14\x00\x00\x03\x00\x04\x00\x00\x03\x00\xc8\x3c\x70\xca\x80'
         self.pps = b'\x00\x00\x00\x01\x68\xee\x3c\xb0'
 
-        # Solo cabeceras de parámetros SPS y PPS para sincronizar el formato H.264
-        # (NO inyectar fotogramas antiguos de test_seg.h264 para evitar imágenes fantasma)
-        self.bootstrap_nals = [self.sps, self.pps]
+        # Cargar secuencia de arranque determinista (SPS + PPS + IDR keyframe inicial)
+        self.bootstrap_nals = []
+        candidates = [
+            "test_seg.h264",
+            os.path.join(os.path.dirname(__file__), "test_seg.h264"),
+            os.path.join(os.path.dirname(__file__), "Air2S_MAVSDK", "test_seg.h264"),
+            os.path.join(os.path.dirname(__file__), "..", "test_seg.h264"),
+            "test_raw.h264",
+            os.path.join(os.path.dirname(__file__), "test_raw.h264"),
+            os.path.join(os.path.dirname(__file__), "Air2S_MAVSDK", "test_raw.h264")
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                try:
+                    with open(c, 'rb') as f:
+                        raw = f.read()
+                    if "test_raw" in c and len(raw) >= 28052:
+                        raw = raw[23016:28052]
+                    nal_indices = [m.start() for m in re.finditer(b'\x00\x00\x00\x01', raw)]
+                    for i, idx in enumerate(nal_indices):
+                        next_idx = nal_indices[i+1] if i+1 < len(nal_indices) else len(raw)
+                        self.bootstrap_nals.append(raw[idx:next_idx])
+                    if len(self.bootstrap_nals) > 0:
+                        break
+                except Exception:
+                    pass
+
+        if not self.bootstrap_nals:
+            self.bootstrap_nals = [self.sps, self.pps]
 
         self.s_out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
@@ -264,10 +290,7 @@ class FreshFrameReader:
                 ret, frame = self.cap.read()
                 if ret and frame is not None:
                     with self.lock:
-                        self.frame_counter += 1
-                        # Drenar los fotogramas iniciales de arranque para mostrar solo video 100% fresco
-                        if self.frame_counter > 10:
-                            self.latest_frame = frame
+                        self.latest_frame = frame
                 else:
                     time.sleep(0.005)
             except Exception:

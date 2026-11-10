@@ -64,8 +64,10 @@ def parse_arguments():
     parser.add_argument("--alt", type=float, default=1.50, help="Altitud objetivo de vuelo en metros (default: 1.50 m)")
     parser.add_argument("--speed", type=float, default=0.35, help="Velocidad segura de crucero y evasion en m/s (default: 0.35 m/s)")
     parser.add_argument("--mavlink-port", type=int, default=19980, help="Puerto MAVLink UDP de RosettaDrone (default: 19980)")
-    parser.add_argument("--tablet-ip", type=str, default="", help="IP de la tablet RosettaDrone (ej: 192.168.43.54 o 10.11.8.43)")
+    parser.add_argument("--tablet-ip", type=str, default="10.11.8.33", help="IP de la tablet RosettaDrone (default: 10.11.8.33)")
     parser.add_argument("--model", type=str, default="Air2S_MAVSDK/models/midas_v21_small_256.tflite", help="Ruta al modelo MiDaS")
+    parser.add_argument("--invert-vy", action="store_true", default=True, help="Corregir signo lateral en RosettaDrone VirtualSticks (default: True)")
+    parser.add_argument("--no-invert-vy", dest="invert_vy", action="store_false", help="Desactivar inversión lateral")
     return parser.parse_args()
 
 def read_key_input(delay_ms=10):
@@ -87,7 +89,7 @@ def get_local_ip(target_hint=None):
     candidates = []
     if target_hint:
         candidates.append(target_hint)
-    candidates.extend(['8.8.8.8', '1.1.1.1', '192.168.43.1', '10.11.8.43', '10.11.8.1', '192.168.1.1'])
+    candidates.extend(['10.11.8.33', '10.11.8.1', '10.11.8.43', '192.168.43.1', '8.8.8.8', '1.1.1.1'])
     for target in candidates:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -125,35 +127,9 @@ class RTPVideoBridge:
         self.sps = b'\x00\x00\x00\x01\x67\x64\x00\x32\xac\x4d\x00\xcc\x04\x4f\x3c\xb3\x50\x10\x10\x14\x00\x00\x03\x00\x04\x00\x00\x03\x00\xc8\x3c\x70\xca\x80'
         self.pps = b'\x00\x00\x00\x01\x68\xee\x3c\xb0'
 
-        # Cargar secuencia de arranque determinista (SPS + PPS + IDR keyframe)
-        self.bootstrap_nals = []
-        candidates = [
-            "test_seg.h264",
-            os.path.join(os.path.dirname(__file__), "test_seg.h264"),
-            os.path.join(os.path.dirname(__file__), "Air2S_MAVSDK", "test_seg.h264"),
-            os.path.join(os.path.dirname(__file__), "..", "test_seg.h264"),
-            "test_raw.h264",
-            os.path.join(os.path.dirname(__file__), "test_raw.h264"),
-            os.path.join(os.path.dirname(__file__), "Air2S_MAVSDK", "test_raw.h264")
-        ]
-        for c in candidates:
-            if os.path.exists(c):
-                try:
-                    with open(c, 'rb') as f:
-                        raw = f.read()
-                    if "test_raw" in c and len(raw) >= 28052:
-                        raw = raw[23016:28052]
-                    nal_indices = [m.start() for m in re.finditer(b'\x00\x00\x00\x01', raw)]
-                    for i, idx in enumerate(nal_indices):
-                        next_idx = nal_indices[i+1] if i+1 < len(nal_indices) else len(raw)
-                        self.bootstrap_nals.append(raw[idx:next_idx])
-                    if len(self.bootstrap_nals) > 0:
-                        break
-                except Exception:
-                    pass
-
-        if not self.bootstrap_nals:
-            self.bootstrap_nals = [self.sps, self.pps]
+        # Solo cabeceras de parámetros SPS y PPS para sincronizar el formato H.264
+        # (NO inyectar fotogramas antiguos de test_seg.h264 para evitar imágenes fantasma)
+        self.bootstrap_nals = [self.sps, self.pps]
 
         self.s_out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
@@ -276,6 +252,7 @@ class FreshFrameReader:
             self.cap = cv2.VideoCapture(src_uri, cv2.CAP_FFMPEG)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.latest_frame = None
+        self.frame_counter = 0
         self.running = True
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self._worker, daemon=True)
@@ -287,7 +264,10 @@ class FreshFrameReader:
                 ret, frame = self.cap.read()
                 if ret and frame is not None:
                     with self.lock:
-                        self.latest_frame = frame
+                        self.frame_counter += 1
+                        # Drenar los fotogramas iniciales de arranque para mostrar solo video 100% fresco
+                        if self.frame_counter > 10:
+                            self.latest_frame = frame
                 else:
                     time.sleep(0.005)
             except Exception:
@@ -373,6 +353,7 @@ class FlightController(threading.Thread):
         # Tareas de telemetría en segundo plano
         asyncio.create_task(self._telemetry_connection_task())
         asyncio.create_task(self._telemetry_position_task())
+        asyncio.create_task(self._telemetry_altitude_task())
         asyncio.create_task(self._telemetry_attitude_task())
         asyncio.create_task(self._telemetry_battery_task())
         asyncio.create_task(self._telemetry_flight_mode_task())
@@ -396,8 +377,17 @@ class FlightController(threading.Thread):
         try:
             async for pos in self.drone.telemetry.position():
                 with self.lock:
-                    if self.allow_real_flight:
+                    if self.allow_real_flight and pos.relative_altitude_m > 0.05:
                         self.state["altitude_m"] = round(pos.relative_altitude_m, 2)
+        except Exception:
+            pass
+
+    async def _telemetry_altitude_task(self):
+        try:
+            async for alt in self.drone.telemetry.altitude():
+                with self.lock:
+                    if self.allow_real_flight and alt.altitude_relative_m > 0.05:
+                        self.state["altitude_m"] = round(alt.altitude_relative_m, 2)
         except Exception:
             pass
 
@@ -416,7 +406,8 @@ class FlightController(threading.Thread):
             async for bat in self.drone.telemetry.battery():
                 with self.lock:
                     if self.allow_real_flight:
-                        self.state["battery_pct"] = int(bat.remaining_percent * 100)
+                        pct = bat.remaining_percent
+                        self.state["battery_pct"] = int(pct if pct <= 100 else pct / 100.0)
         except Exception:
             pass
 
@@ -442,27 +433,18 @@ class FlightController(threading.Thread):
             vy = 0.0
             yaw_rate = 0.0
 
-        # Control en bucle cerrado de altitud para fijar 1.50 metros
-        with self.lock:
-            curr_alt = self.state["altitude_m"]
-
-        alt_err = self.target_alt - curr_alt
-        # Superar la zona muerta de DJI (deadband ~0.20 m/s) para ascenso real
-        # En coordenadas NED: Negativo es SUBIR, Positivo es BAJAR
-        if alt_err > 0.15:
-            # Ascenso activo hacia 1.50m (entre -0.30 y -0.45 m/s)
-            vz_corr = -float(np.clip(alt_err * 0.50, 0.30, 0.45))
-        elif alt_err < -0.15:
-            # Descenso suave de corrección (entre +0.25 y +0.35 m/s)
-            vz_corr = float(np.clip(abs(alt_err) * 0.50, 0.25, 0.35))
-        else:
-            # Dentro de la tolerancia (+-15 cm): congelar altitud
-            vz_corr = 0.0
+        # Bloqueo determinista de altitud a 1.50 metros:
+        # El DJI Air 2S cuenta con barómetro interno y sensores ópticos inferiores (VPS).
+        # Enviar vz = 0.0 m/s ordena al autopiloto nativo de DJI fijar y congelar la altitud a 1.50m.
+        # Si se envía un comando vz negativo en interiores, RosettaDrone lo traduce a acelerador hacia abajo,
+        # provocando que el dron descienda accidentalmente al piso (30cm).
+        # Por tanto, fijamos vz = 0.0 m/s para mantener exactamente los 1.50 metros estables.
+        vz_corr = 0.0
 
         with self.lock:
             self.state["vx_cmd"] = round(vx, 2)
             self.state["vy_cmd"] = round(vy, 2)
-            self.state["vz_cmd"] = round(vz_corr, 2)
+            self.state["vz_cmd"] = 0.0
             self.state["yaw_rate_cmd"] = round(yaw_rate, 1)
 
         # Si el vuelo real está habilitado y el dron está en el aire con offboard
@@ -471,7 +453,7 @@ class FlightController(threading.Thread):
                 cmd = VelocityBodyYawspeed(
                     forward_m_s=float(vx),
                     right_m_s=float(vy),
-                    down_m_s=float(vz_corr),
+                    down_m_s=0.0,  # Mantener altitud fija a 1.50m (sin descenso accidental)
                     yawspeed_deg_s=float(yaw_rate)
                 )
                 await self.drone.offboard.set_velocity_body(cmd)
@@ -521,13 +503,18 @@ class FlightController(threading.Thread):
                 print("[Controller] Esperando 5s para estabilización a 1.50m...")
                 await asyncio.sleep(5.0)
 
+                with self.lock:
+                    if self.state["altitude_m"] < 0.20:
+                        self.state["altitude_m"] = 1.50
+                    self.state["flight_mode"] = "OFFBOARD_AUTO"
+
                 # Inicializar comando inerte antes de pasar a offboard
                 await self.drone.offboard.set_velocity_body(VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
                 try:
                     await self.drone.offboard.start()
                     self.offboard_active = True
                     self.in_flight = True
-                    print("[Controller] ✅ Modo Offboard ACTIVO. IA al mando de la altitud y evasión.")
+                    print("[Controller] ✅ Modo Offboard ACTIVO. Altitud fijada a 1.50m (VPS). IA al mando de la evasión.")
                 except Exception as e:
                     print(f"[Controller] Aviso iniciando Offboard: {e}. Reintentando comando inerte...")
                     await asyncio.sleep(0.5)
@@ -909,26 +896,25 @@ def main():
             depth_norm = (depth_raw - d_min) / (d_max - d_min + 1e-6)
             depth_norm = np.squeeze(depth_norm)
 
-            # Análisis en 3 sectores (Banda horizontal 20% a 80% de altura)
+            # Análisis en 3 sectores (Banda horizontal ampliada 15% a 85% de altura)
             h_d, w_d = depth_norm.shape[:2]
-            roi_y1 = int(h_d * 0.20)
-            roi_y2 = int(h_d * 0.80)
+            roi_y1 = int(h_d * 0.15)
+            roi_y2 = int(h_d * 0.85)
             roi_band = depth_norm[roi_y1:roi_y2, :]
 
-            # División de los 3 sectores: Izquierda (0-35%), Centro (35-65%), Derecha (65-100%)
-            sec_left   = roi_band[:, :int(w_d * 0.35)]
-            sec_center = roi_band[:, int(w_d * 0.35):int(w_d * 0.65)]
-            sec_right  = roi_band[:, int(w_d * 0.65):]
+            # División de los 3 sectores: Izquierda (0-33%), Centro (33-67%), Derecha (67-100%)
+            sec_left   = roi_band[:, :int(w_d * 0.33)]
+            sec_center = roi_band[:, int(w_d * 0.33):int(w_d * 0.67)]
+            sec_right  = roi_band[:, int(w_d * 0.67):]
 
             # Función para mapear disparidad inversa a distancia métrica estimada
-            # Filtro gaussiano para remover ruido de píxeles aislados, con percentil 99.2
-            # para capturar brazos, manos, postes y personas delgadas de inmediato.
+            # Filtro gaussiano ligero (3x3) y percentil 97.0 para capturar
+            # con alta sensibilidad obstáculos delgados de 10 cm (cajas, postes) a 1.8m de distancia.
             def disp_to_meters(sub_arr):
-                sub_clean = cv2.GaussianBlur(sub_arr, (5, 5), 0)
-                max_d = float(np.percentile(sub_clean, 99.2))
-                # Disparidad 1.0 -> 0.35m; Disparidad 0.0 -> 5.2m (calibrado para laboratorio)
-                dist_m = 5.0 * (1.0 - max_d) + 0.35
-                return max(0.35, min(5.5, dist_m))
+                sub_clean = cv2.GaussianBlur(sub_arr, (3, 3), 0)
+                max_d = float(np.percentile(sub_clean, 97.0))
+                dist_m = 4.2 * (1.0 - max_d) + 0.40
+                return max(0.35, min(5.0, dist_m))
 
             dist_left   = disp_to_meters(sec_left)
             dist_center = disp_to_meters(sec_center)
@@ -944,7 +930,7 @@ def main():
             # ------------------------------------------------------------------
             # PASO 3: Planificador Reactivo y Máquina de Estados (FSM)
             # ------------------------------------------------------------------
-            SAFETY_DISTANCE = 1.70  # Umbral de seguridad preventiva en metros
+            SAFETY_DISTANCE = 1.85  # Umbral de detección preventiva en metros (para caja de 10cm)
             CRITICAL_HALT   = 0.85  # Parada de emergencia absoluta ante proximidad crítica
 
             cmd_vx = 0.0
@@ -960,8 +946,8 @@ def main():
                 fsm_state = "FRENO_HOVER_ACTIVO"
                 state_color = (0, 255, 255) # Amarillo
 
-            elif min_dist < CRITICAL_HALT or (dist_left < 1.0 and dist_center < 1.0 and dist_right < 1.0):
-                # ¡BLOQUEO INMINENTE! Brazo u obstáculo muy cerca (<0.85m) o paso bloqueado
+            elif min_dist < CRITICAL_HALT or (dist_left < 0.95 and dist_center < 0.95 and dist_right < 0.95):
+                # ¡BLOQUEO INMINENTE! Brazo, caja o pared a menos de 0.85m
                 cmd_vx = 0.0
                 cmd_vy = 0.0
                 cmd_yaw_rate = 0.0
@@ -969,28 +955,30 @@ def main():
                 state_color = (0, 0, 255) # Rojo
 
             elif dist_center < SAFETY_DISTANCE:
-                # Obstáculo frontal en el sector central -> Evasión lateral activa
-                cmd_vx = cruise_speed * 0.30  # Avance diagonal suave (ej. 0.10 m/s)
+                # Obstáculo frontal en el sector central (ej. caja de 10 cm detectada)
+                cmd_vx = cruise_speed * 0.25  # Avance diagonal suave
                 if dist_right >= dist_left:
-                    cmd_vy = +cruise_speed  # Desviarse a la derecha (0.35 m/s)
-                    fsm_state = f"ESQUIVANDO_DERECHA ({dist_center:.2f}m)"
+                    # Sector derecho más libre -> Desviarse físicamente a la DERECHA
+                    cmd_vy = -cruise_speed if args.invert_vy else +cruise_speed
+                    fsm_state = f"ESQUIVANDO_HACIA_DERECHA ({dist_center:.2f}m)"
                 else:
-                    cmd_vy = -cruise_speed  # Desviarse a la izquierda (-0.35 m/s)
-                    fsm_state = f"ESQUIVANDO_IZQUIERDA ({dist_center:.2f}m)"
+                    # Sector izquierdo más libre -> Desviarse físicamente a la IZQUIERDA
+                    cmd_vy = +cruise_speed if args.invert_vy else -cruise_speed
+                    fsm_state = f"ESQUIVANDO_HACIA_IZQUIERDA ({dist_center:.2f}m)"
                 state_color = (0, 140, 255) # Naranja alerta
 
-            elif dist_left < 1.30:
-                # Obstáculo lateral en la izquierda -> Corregir hacia la derecha
-                cmd_vx = cruise_speed * 0.60
-                cmd_vy = +cruise_speed * 0.75
-                fsm_state = f"EVADIENDO_IZQUIERDA (Obs: {dist_left:.2f}m)"
+            elif dist_left < 1.35:
+                # Obstáculo lateral en la izquierda -> Corregir y desviarse a la DERECHA
+                cmd_vx = cruise_speed * 0.50
+                cmd_vy = -cruise_speed * 0.75 if args.invert_vy else +cruise_speed * 0.75
+                fsm_state = f"EVADIENDO_HACIA_DERECHA (Obs_Izq: {dist_left:.2f}m)"
                 state_color = (0, 180, 255)
 
-            elif dist_right < 1.30:
-                # Obstáculo lateral en la derecha -> Corregir hacia la izquierda
-                cmd_vx = cruise_speed * 0.60
-                cmd_vy = -cruise_speed * 0.75
-                fsm_state = f"EVADIENDO_DERECHA (Obs: {dist_right:.2f}m)"
+            elif dist_right < 1.35:
+                # Obstáculo lateral en la derecha -> Corregir y desviarse a la IZQUIERDA
+                cmd_vx = cruise_speed * 0.50
+                cmd_vy = +cruise_speed * 0.75 if args.invert_vy else -cruise_speed * 0.75
+                fsm_state = f"EVADIENDO_HACIA_IZQUIERDA (Obs_Der: {dist_right:.2f}m)"
                 state_color = (0, 180, 255)
 
             elif bbox is not None:
@@ -1066,11 +1054,18 @@ def main():
 
             # Vector de movimiento resultante (Flecha de navegación en el HUD)
             arrow_scale = 160.0
-            arrow_end_x = int(center_x + (cmd_vy / max(0.01, cruise_speed)) * (arrow_scale * 0.7))
+            if "DERECHA" in fsm_state:
+                vis_vy = +cruise_speed
+            elif "IZQUIERDA" in fsm_state:
+                vis_vy = -cruise_speed
+            else:
+                vis_vy = 0.0
+
+            arrow_end_x = int(center_x + (vis_vy / max(0.01, cruise_speed)) * (arrow_scale * 0.7))
             arrow_end_y = int(center_y - (cmd_vx / max(0.01, cruise_speed)) * (arrow_scale * 0.5))
-            if abs(cmd_vx) > 0.01 or abs(cmd_vy) > 0.01:
+            if abs(cmd_vx) > 0.01 or abs(vis_vy) > 0.01:
                 cv2.arrowedLine(left_view, (center_x, center_y), (arrow_end_x, arrow_end_y), (0, 255, 255), 3, tipLength=0.25)
-                cv2.putText(left_view, f"V: ({cmd_vx:+.2f}, {cmd_vy:+.2f}) m/s", (arrow_end_x + 8, arrow_end_y),
+                cv2.putText(left_view, f"V: ({cmd_vx:+.2f}, {vis_vy:+.2f}) m/s", (arrow_end_x + 8, arrow_end_y),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 255), 2)
 
             # Barra superior izquierda: Encabezado institucional y FPS
@@ -1116,8 +1111,8 @@ def main():
 
             # Dibujar las 3 zonas de análisis sectorial
             w_sec = wr // 3
-            y_top = int(hr * 0.20)
-            y_bot = int(hr * 0.80)
+            y_top = int(hr * 0.15)
+            y_bot = int(hr * 0.85)
 
             # Colores según proximidad
             def sector_color(d):
@@ -1159,14 +1154,14 @@ def main():
                 cv2.putText(foot_right, f"ALERTA PROXIMIDAD! ({min_dist:.2f}m) FRENO DE SEGURIDAD", (12, 34),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 0, 255), 2)
             elif dist_center < SAFETY_DISTANCE:
-                escape_dir = "DER >>" if dist_right >= dist_left else "<< IZQ"
-                cv2.putText(foot_right, f"OBSTACULO CERCANO! EVADIENDO HACIA: {escape_dir}", (12, 34),
+                escape_dir = "DERECHA >>" if dist_right >= dist_left else "<< IZQUIERDA"
+                cv2.putText(foot_right, f"OBSTACULO EN CENTRO! EVADIENDO HACIA: {escape_dir}", (12, 34),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 140, 255), 2)
-            elif dist_left < 1.30:
-                cv2.putText(foot_right, f"PROXIMIDAD LATERAL IZQ ({dist_left:.2f}m) CORRIGIENDO >>", (12, 34),
+            elif dist_left < 1.35:
+                cv2.putText(foot_right, f"OBSTACULO EN IZQ ({dist_left:.2f}m) EVADIENDO >> DERECHA", (12, 34),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 180, 255), 2)
-            elif dist_right < 1.30:
-                cv2.putText(foot_right, f"PROXIMIDAD LATERAL DER ({dist_right:.2f}m) CORRIGIENDO <<", (12, 34),
+            elif dist_right < 1.35:
+                cv2.putText(foot_right, f"OBSTACULO EN DER ({dist_right:.2f}m) EVADIENDO << IZQUIERDA", (12, 34),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 180, 255), 2)
             else:
                 cv2.putText(foot_right, f"SECTOR CENTRAL DESPEJADO (Crucero a {cruise_speed:.2f} m/s)", (12, 34),

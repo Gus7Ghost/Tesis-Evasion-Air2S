@@ -770,8 +770,16 @@ def main():
                 break
 
     print(f"[*] Cargando red neuronal de profundidad: {model_path}")
-    import tensorflow as tf
-    interpreter = tf.lite.Interpreter(model_path=model_path, num_threads=4)
+    try:
+        from ai_edge_litert.interpreter import Interpreter
+        interpreter = Interpreter(model_path=model_path, num_threads=4)
+    except Exception:
+        try:
+            import tflite_runtime.interpreter as tflite
+            interpreter = tflite.Interpreter(model_path=model_path, num_threads=4)
+        except Exception:
+            import tensorflow as tf
+            interpreter = tf.lite.Interpreter(model_path=model_path, num_threads=4)
     interpreter.allocate_tensors()
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()

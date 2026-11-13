@@ -45,7 +45,6 @@ except Exception:
 
 # Suprimir advertencias menores de TensorFlow
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-import tensorflow as tf
 
 def get_local_ip():
     for target in ['10.11.8.43', '10.11.8.1', '8.8.8.8']:
@@ -517,7 +516,16 @@ def main():
         sys.exit(1)
 
     print(f"[*] Cargando modelo MiDaS Small desde: {model_path}")
-    interpreter = tf.lite.Interpreter(model_path=model_path, num_threads=4)
+    try:
+        from ai_edge_litert.interpreter import Interpreter
+        interpreter = Interpreter(model_path=model_path, num_threads=4)
+    except Exception:
+        try:
+            import tflite_runtime.interpreter as tflite
+            interpreter = tflite.Interpreter(model_path=model_path, num_threads=4)
+        except Exception:
+            import tensorflow as tf
+            interpreter = tf.lite.Interpreter(model_path=model_path, num_threads=4)
     interpreter.allocate_tensors()
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()

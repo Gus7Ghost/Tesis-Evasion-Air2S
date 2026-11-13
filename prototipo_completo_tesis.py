@@ -64,7 +64,7 @@ def parse_arguments():
     parser.add_argument("--alt", type=float, default=1.50, help="Altitud objetivo de vuelo en metros (default: 1.50 m)")
     parser.add_argument("--speed", type=float, default=0.35, help="Velocidad segura de crucero y evasion en m/s (default: 0.35 m/s)")
     parser.add_argument("--mavlink-port", type=int, default=19980, help="Puerto MAVLink UDP de RosettaDrone (default: 19980)")
-    parser.add_argument("--tablet-ip", type=str, default="10.11.8.33", help="IP de la tablet RosettaDrone (default: 10.11.8.33)")
+    parser.add_argument("--tablet-ip", type=str, default="10.11.8.57", help="IP de la tablet RosettaDrone (default: 10.11.8.57)")
     parser.add_argument("--model", type=str, default="Air2S_MAVSDK/models/midas_v21_small_256.tflite", help="Ruta al modelo MiDaS")
     parser.add_argument("--invert-vy", action="store_true", default=True, help="Corregir signo lateral en RosettaDrone VirtualSticks (default: True)")
     parser.add_argument("--no-invert-vy", dest="invert_vy", action="store_false", help="Desactivar inversión lateral")

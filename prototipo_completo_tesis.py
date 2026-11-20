@@ -69,6 +69,7 @@ def parse_arguments():
     parser.add_argument("--model", type=str, default="Air2S_MAVSDK/models/midas_v21_small_256.tflite", help="Ruta al modelo MiDaS")
     parser.add_argument("--invert-vy", action="store_true", default=False, help="Invertir signo lateral si el marco de referencia lo requiere (default: False)")
     parser.add_argument("--no-invert-vy", dest="invert_vy", action="store_false", help="Desactivar inversión lateral")
+    parser.add_argument("--no-gui", action="store_true", help="Omitir la pantalla gráfica de configuración y usar parámetros directos")
     return parser.parse_args()
 
 def read_key_input(delay_ms=10):
@@ -891,7 +892,27 @@ class RobustTargetTracker:
 # ==============================================================================
 def main():
     args = parse_arguments()
-    local_ip = get_local_ip(args.tablet_ip)
+
+    # Pantalla interactiva para verificar/modificar IPs de Tablet y Laptop
+    if not args.no_gui:
+        try:
+            from interfaz_config_red import get_network_config_interactive
+            net_cfg = get_network_config_interactive(current_args=args)
+            if net_cfg is None:
+                print("\n[Operación cancelada por el usuario en la pantalla de configuración].")
+                return
+            args.tablet_ip = net_cfg.get("tablet_ip", args.tablet_ip)
+            local_ip = net_cfg.get("laptop_ip", get_local_ip(args.tablet_ip))
+            if "use_drone_video" in net_cfg:
+                args.drone = net_cfg["use_drone_video"]
+            if "real_flight" in net_cfg:
+                args.fly = net_cfg["real_flight"]
+        except Exception as e:
+            print(f"[Aviso] Pantalla de configuración no disponible ({e}). Continuando...")
+            local_ip = get_local_ip(args.tablet_ip)
+    else:
+        local_ip = get_local_ip(args.tablet_ip)
+
     tablet_ip_str = args.tablet_ip if args.tablet_ip else "Configurada en RosettaDrone"
 
     print("=" * 76)

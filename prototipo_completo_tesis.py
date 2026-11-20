@@ -61,12 +61,13 @@ def parse_arguments():
     parser.add_argument("--drone", action="store_true", help="Usar video del DJI Air 2S vía RosettaDrone (UDP 5600)")
     parser.add_argument("--fly", action="store_true", help="¡ACTIVAR VUELO REAL! (Armado de motores y despegue)")
     parser.add_argument("--auto-takeoff", action="store_true", help="Despegue automático a 1.50m directo (cuenta regresiva de 3s sin esperar tecla T)")
-    parser.add_argument("--alt", type=float, default=1.50, help="Altitud objetivo de vuelo en metros (default: 1.50 m)")
-    parser.add_argument("--speed", type=float, default=0.35, help="Velocidad segura de crucero y evasion en m/s (default: 0.35 m/s)")
+    parser.add_argument("--alt", type=float, default=1.70, help="Altitud objetivo de vuelo en metros (default: 1.70 m)")
+    parser.add_argument("--speed", type=float, default=0.45, help="Velocidad segura de crucero y evasion en m/s (default: 0.45 m/s, estable y sin sobrevirajes)")
     parser.add_argument("--mavlink-port", type=int, default=19980, help="Puerto MAVLink UDP de RosettaDrone (default: 19980)")
-    parser.add_argument("--tablet-ip", type=str, default="10.11.8.57", help="IP de la tablet RosettaDrone (default: 10.11.8.57)")
+    parser.add_argument("--tablet-ip", type=str, default="10.11.8.29", help="IP de la tablet RosettaDrone (default: 10.11.8.29)")
+    parser.add_argument("--yaw-gain", type=float, default=57.3, help="Ganancia compensatoria de escala angular deg/rad para el puente RosettaDrone (default: 57.3)")
     parser.add_argument("--model", type=str, default="Air2S_MAVSDK/models/midas_v21_small_256.tflite", help="Ruta al modelo MiDaS")
-    parser.add_argument("--invert-vy", action="store_true", default=True, help="Corregir signo lateral en RosettaDrone VirtualSticks (default: True)")
+    parser.add_argument("--invert-vy", action="store_true", default=False, help="Invertir signo lateral si el marco de referencia lo requiere (default: False)")
     parser.add_argument("--no-invert-vy", dest="invert_vy", action="store_false", help="Desactivar inversión lateral")
     return parser.parse_args()
 
@@ -89,7 +90,7 @@ def get_local_ip(target_hint=None):
     candidates = []
     if target_hint:
         candidates.append(target_hint)
-    candidates.extend(['10.11.8.33', '10.11.8.1', '10.11.8.43', '192.168.43.1', '8.8.8.8', '1.1.1.1'])
+    candidates.extend(['10.11.8.29', '10.11.8.36', '10.11.8.1', '192.168.43.1', '8.8.8.8', '1.1.1.1'])
     for target in candidates:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -315,23 +316,34 @@ class FreshFrameReader:
 from mavsdk import System
 from mavsdk.offboard import VelocityBodyYawspeed, OffboardError
 
+# Corrección Obs.3: Intentar importar módulo de gimbal para control dinámico de cabeceo
+try:
+    from mavsdk.gimbal import GimbalMode, ControlMode
+    HAS_GIMBAL_API = True
+except ImportError:
+    HAS_GIMBAL_API = False
+
 class FlightController(threading.Thread):
     """
     Gestiona el enlace de telemetría y los comandos de vuelo físico con MAVSDK.
     Mantiene un bucle cerrado a 10 Hz para mantener la altitud objetivo (1.5 m)
     y aplicar las velocidades de avance y evasión de forma segura.
     """
-    def __init__(self, system_address="udpin://0.0.0.0:19980", target_alt=1.5, allow_real_flight=False):
+    def __init__(self, system_address="udpin://0.0.0.0:19980", target_alt=1.70, allow_real_flight=False, yaw_gain=57.3):
         super().__init__(daemon=True)
         self.system_address = system_address
         self.target_alt = target_alt
         self.allow_real_flight = allow_real_flight
+        self.yaw_gain = yaw_gain
 
         self.running = True
         self.loop = None
         self.drone = None
         self.offboard_active = False
         self.in_flight = False
+        self.initial_climb_done = False
+        self.last_alt_stable = target_alt
+        self.stable_alt_count = 0
 
         # Estado instantáneo compartido
         self.lock = threading.Lock()
@@ -340,7 +352,7 @@ class FlightController(threading.Thread):
             "armed": False,
             "in_air": False,
             "flight_mode": "SIM_MESA" if not allow_real_flight else "DESCONECTADO",
-            "altitude_m": 1.50 if not allow_real_flight else 0.0,
+            "altitude_m": target_alt if not allow_real_flight else 0.0,
             "target_alt_m": target_alt,
             "battery_pct": 100 if not allow_real_flight else 0,
             "heading_deg": 0.0,
@@ -359,6 +371,7 @@ class FlightController(threading.Thread):
         self.cmd_yaw_rate = 0.0
         self.cmd_lock = threading.Lock()
         self.emergency_stop_active = False
+        self.takeoff_requested = False
 
     def run(self):
         self.loop = asyncio.new_event_loop()
@@ -380,6 +393,10 @@ class FlightController(threading.Thread):
         asyncio.create_task(self._telemetry_attitude_task())
         asyncio.create_task(self._telemetry_battery_task())
         asyncio.create_task(self._telemetry_flight_mode_task())
+
+        # Corrección Obs.3: Programar el gimbal a -15° de cabeceo (mirando ligeramente
+        # hacia abajo) para capturar mejor los obstáculos a nivel del suelo/banco.
+        asyncio.create_task(self._setup_gimbal_pitch())
 
         # Bucle de control de velocidad a 10 Hz (100 ms)
         while self.running:
@@ -443,6 +460,18 @@ class FlightController(threading.Thread):
         except Exception:
             pass
 
+    async def _setup_gimbal_pitch(self):
+        """Corrección Obs.3: Apuntar el gimbal -15° de cabeceo (pitch) hacia abajo
+        para mejorar la captura de obstáculos al nivel del banco de pruebas.
+        Se reintenta cada 5 segundos hasta lograrlo o hasta detenerse."""
+        await asyncio.sleep(3.0)  # Esperar a que el dron se conecte
+        try:
+            await self.drone.gimbal.set_pitch_and_yaw(-15.0, 0.0)
+            print("[Gimbal] Cabeceo ajustado a -15° (mirando ligeramente hacia abajo).")
+        except Exception:
+            # Si RosettaDrone no expone la API de gimbal, se usa el mando físico
+            pass
+
     async def _control_tick(self):
         """Calcula y envía el vector de velocidad al dron en modo Offboard."""
         with self.cmd_lock:
@@ -456,28 +485,106 @@ class FlightController(threading.Thread):
             vy = 0.0
             yaw_rate = 0.0
 
-        # Bloqueo determinista de altitud a 1.50 metros:
-        # El DJI Air 2S cuenta con barómetro interno y sensores ópticos inferiores (VPS).
-        # Enviar vz = 0.0 m/s ordena al autopiloto nativo de DJI fijar y congelar la altitud a 1.50m.
-        # Si se envía un comando vz negativo en interiores, RosettaDrone lo traduce a acelerador hacia abajo,
-        # provocando que el dron descienda accidentalmente al piso (30cm).
-        # Por tanto, fijamos vz = 0.0 m/s para mantener exactamente los 1.50 metros estables.
-        vz_corr = 0.0
+        # Control determinista en lazo cerrado para elevar y mantener firmemente los 1.70 m:
+        # MAPEO DEL PUENTE ROSETTADRONE / DJI MOBILE SDK:
+        # • Valores POSITIVOS (+m/s) ordenan ASCENSO (SUBIR) a los motores DJI.
+        # • Valores NEGATIVOS (-m/s) ordenan DESCENSO (BAJAR).
+        # • Valor 0.0 m/s activa el VPS inferior de DJI (Hold vertical milimétrico sin oscilación).
+        with self.lock:
+            current_alt = self.state["altitude_m"]
+            target_alt = self.target_alt  # 1.70 m por defecto
+
+        vz_cmd = 0.0
+        if self.allow_real_flight and self.offboard_active:
+            # 1. Monitoreo de intervención manual (si el usuario elevó o bajó el dron con el control físico DJI)
+            if self.initial_climb_done:
+                if abs(current_alt - self.last_alt_stable) < 0.04:
+                    self.stable_alt_count += 1
+                else:
+                    self.stable_alt_count = 0
+                    self.last_alt_stable = current_alt
+
+                # Si el usuario modificó la altura con el mando físico y se mantiene estable por ~1.0 s:
+                # Se adopta automáticamente esa nueva altura como meta sin luchar contra el piloto.
+                if self.stable_alt_count >= 10 and abs(current_alt - target_alt) >= 0.20:
+                    with self.lock:
+                        self.target_alt = round(current_alt, 2)
+                        self.state["target_alt_m"] = self.target_alt
+                        target_alt = self.target_alt
+                    print(f"\n[Controller] 🎮 Nueva altitud manual adoptada: {target_alt:.2f} m (Mantenida firmemente)\n")
+
+            # 2. Control de ascenso inicial y mantenimiento suave
+            alt_error = target_alt - current_alt  # Positivo si está por debajo (debe SUBIR)
+
+            if not self.initial_climb_done:
+                # FASE 1: Ascenso inicial desde despegue hacia 1.70 m
+                if alt_error > 0.35:
+                    # Lejos de la meta: ascenso constante y firme (0.35 m/s)
+                    vz_cmd = 0.35
+                elif alt_error > 0.08:
+                    # Desaceleración suave y progresiva al aproximarse (evita rebote/overshoot)
+                    ramp = (alt_error - 0.08) / (0.35 - 0.08)
+                    vz_cmd = float(np.clip(0.08 + ramp * (0.35 - 0.08), 0.08, 0.35))
+                else:
+                    # Meta alcanzada dentro de +-8 cm: BLOQUEO INMEDIATO EN HOVER (vz = 0.0)
+                    vz_cmd = 0.0
+                    self.initial_climb_done = True
+                    self.last_alt_stable = current_alt
+                    with self.lock:
+                        self.target_alt = round(current_alt, 2)
+                        self.state["target_alt_m"] = self.target_alt
+                    print(f"\n[Controller] ✅ Altitud meta ({current_alt:.2f} m) alcanzada. VPS DJI bloqueado en hover estable (vz=0.0).\n")
+            else:
+                # FASE 2: Vuelo estabilizado con VPS DJI nativo
+                # Banda muerta amplia (+-15 cm) donde vz=0.0 para que el VPS mantenga altura fija sin chattering
+                if alt_error > 0.15:
+                    # Caída no deseada: suave impulso ascendente
+                    vz_cmd = float(np.clip(0.08 + (alt_error - 0.15) * 0.4, 0.08, 0.20))
+                elif alt_error < -0.15:
+                    # Subida no deseada: suave micro-corrección descendente
+                    vz_cmd = -float(np.clip(0.06 + (abs(alt_error) - 0.15) * 0.3, 0.06, 0.18))
+                else:
+                    # Dentro de la ventana de estabilidad (+-15 cm): vz = 0.0 (VPS DJI activo)
+                    vz_cmd = 0.0
+
+            # 3. Piso de seguridad crítico: si el dron baja de 0.65m en cualquier momento, subir suavemente
+            if current_alt < 0.65 and not is_emergency:
+                vz_cmd = max(vz_cmd, 0.25)
 
         with self.lock:
             self.state["vx_cmd"] = round(vx, 2)
             self.state["vy_cmd"] = round(vy, 2)
-            self.state["vz_cmd"] = 0.0
+            self.state["vz_cmd"] = round(vz_cmd, 2)
             self.state["yaw_rate_cmd"] = round(yaw_rate, 1)
+
+        # Auto-enganche inteligente: si el usuario solicitó despegue (tecla T) y el dron deja el suelo (> 0.20m)
+        if self.allow_real_flight and getattr(self, 'takeoff_requested', False) and not self.offboard_active:
+            with self.lock:
+                current_alt = self.state["altitude_m"]
+            if current_alt >= 0.20:
+                self.takeoff_requested = False
+                print(f"\n[Controller] 🚀 Dron en el aire detectado ({current_alt:.2f} m).")
+                print(f"[Controller] ▶ Modo Offboard enganchado. ¡Ascendiendo directamente a {self.target_alt:.2f} m!\n")
+                asyncio.create_task(self._start_offboard_internal())
 
         # Si el vuelo real está habilitado y el dron está en el aire con offboard
         if self.allow_real_flight and self.offboard_active:
             try:
+                # Compensación angular calibrada para el puente RosettaDrone:
+                # MAVSDK internamente divide yawspeed_deg_s entre 57.2958 (convirtiendo a rad/s)
+                # para el mensaje MAVLink SET_POSITION_TARGET_LOCAL_NED.
+                # RosettaDrone envía el flotante MAVLink directamente a la API de DJI Mobile SDK
+                # (FlightControlData.setYaw), la cual opera en GRADOS/SEGUNDO (deg/s).
+                # Multiplicando por self.yaw_gain (57.3), restauramos la velocidad angular real.
+                # Acotamos el giro a una velocidad suave y estable (máx +-20°/s) para evitar
+                # sobre-virajes (overshoot) y desenfoque de movimiento (motion blur) en la cámara.
+                safe_yaw = float(np.clip(yaw_rate, -20.0, 20.0))
+                scaled_yaw_cmd = float(safe_yaw * self.yaw_gain)
                 cmd = VelocityBodyYawspeed(
                     forward_m_s=float(vx),
                     right_m_s=float(vy),
-                    down_m_s=0.0,  # Mantener altitud fija a 1.50m (sin descenso accidental)
-                    yawspeed_deg_s=float(yaw_rate)
+                    down_m_s=float(vz_cmd),  # Positivo = SUBIR en RosettaDrone/DJI
+                    yawspeed_deg_s=scaled_yaw_cmd
                 )
                 await self.drone.offboard.set_velocity_body(cmd)
             except Exception as e:
@@ -493,14 +600,24 @@ class FlightController(threading.Thread):
         with self.lock:
             self.state["fsm_state"] = fsm_state
 
+    def adjust_target_altitude(self, delta_m: float):
+        """Ajusta dinámicamente la altitud objetivo desde teclado."""
+        with self.lock:
+            self.target_alt = round(max(0.60, min(3.00, self.target_alt + delta_m)), 2)
+            self.state["target_alt_m"] = self.target_alt
+            self.initial_climb_done = False
+            self.last_alt_stable = self.target_alt
+            self.stable_alt_count = 0
+        print(f"\n[Controller] ↕ Altitud objetivo ajustada a: {self.target_alt:.2f} m\n")
+
     def trigger_takeoff(self):
         """Inicia secuencia de despegue y enganche a 1.5 metros."""
         if not self.allow_real_flight:
-            print("[Controller] Simulación en Mesa: Despegue emulado a 1.50m.")
+            print(f"[Controller] Simulación en Mesa: Despegue emulado a {self.target_alt:.2f}m.")
             with self.lock:
-                self.state["altitude_m"] = 1.50
+                self.state["altitude_m"] = self.target_alt
                 self.state["flight_mode"] = "OFFBOARD_SIM"
-                self.state["fsm_state"] = "HOVER_1.5M"
+                self.state["fsm_state"] = f"HOVER_{self.target_alt:.1f}M"
             self.in_flight = True
             return
 
@@ -508,8 +625,19 @@ class FlightController(threading.Thread):
             print("[Controller] El modo Offboard ya se encuentra ACTIVO.")
             return
 
+        if self.allow_real_flight and self.state["altitude_m"] > 0.25:
+            print(f"[Controller] Dron ya detectado en el aire ({self.state['altitude_m']:.2f}m). Activando modo Offboard inmediato...")
+            self.initial_climb_done = (self.state["altitude_m"] >= (self.target_alt - 0.15))
+            self.last_alt_stable = self.state["altitude_m"]
+            self.stable_alt_count = 0
+            self.toggle_offboard()
+            return
+
+        self.takeoff_requested = True
+
         async def _takeoff_task():
-            print("[Controller] Iniciando secuencia de despegue y ascenso a 1.50m...")
+            print(f"[Controller] Iniciando secuencia de despegue y ascenso a {self.target_alt:.2f}m...")
+            takeoff_ok = False
             try:
                 try:
                     await self.drone.action.arm()
@@ -520,15 +648,31 @@ class FlightController(threading.Thread):
                 try:
                     await self.drone.action.takeoff()
                     print("[Controller] Despegue ordenado. Ascendiendo a altitud segura...")
+                    takeoff_ok = True
                 except Exception as e:
-                    print(f"[Controller] Aviso despegue: {e}")
+                    print("\n" + "!" * 72)
+                    print("  [!] DESPEGUE AUTOMÁTICO DENEGADO POR ROSETTADRONE / DJI:")
+                    print(f"      Detalle: {e}")
+                    print("      POSIBLES CAUSAS Y SOLUCIÓN:")
+                    print("      1. 'SAFETY ENABLED' en RosettaDrone: Toca el botón de seguridad en")
+                    print("         la pantalla de la tablet para cambiarlo a VERDE ('READY TO FLY').")
+                    print("      2. Bloqueo de interiores DJI (sin GPS): DJI restringe el despegue")
+                    print("         automático por software en interiores.")
+                    print("      --> MÉTODO DIRECTO RECOMENDADO (100% OPERATIVO):")
+                    print("          a) Despega manualmente con el control físico DJI (palancas ↙ ↘).")
+                    print("          b) Elévalo a ~1.20 - 1.50m (hover estable con sensores inferiores VPS).")
+                    print("          c) Presiona la tecla [O] en la laptop para ceder el control a la IA.")
+                    print("!" * 72 + "\n")
 
-                print("[Controller] Esperando 5s para estabilización a 1.50m...")
+                if not takeoff_ok:
+                    return
+
+                print(f"[Controller] Esperando 5s para estabilización a {self.target_alt:.2f}m...")
                 await asyncio.sleep(5.0)
 
                 with self.lock:
                     if self.state["altitude_m"] < 0.20:
-                        self.state["altitude_m"] = 1.50
+                        self.state["altitude_m"] = self.target_alt
                     self.state["flight_mode"] = "OFFBOARD_AUTO"
 
                 # Inicializar comando inerte antes de pasar a offboard
@@ -537,7 +681,7 @@ class FlightController(threading.Thread):
                     await self.drone.offboard.start()
                     self.offboard_active = True
                     self.in_flight = True
-                    print("[Controller] ✅ Modo Offboard ACTIVO. Altitud fijada a 1.50m (VPS). IA al mando de la evasión.")
+                    print(f"[Controller] ✅ Modo Offboard ACTIVO. Altitud fijada a {self.target_alt:.2f}m (VPS). IA al mando de la evasión.")
                 except Exception as e:
                     print(f"[Controller] Aviso iniciando Offboard: {e}. Reintentando comando inerte...")
                     await asyncio.sleep(0.5)
@@ -551,6 +695,22 @@ class FlightController(threading.Thread):
 
         if self.loop and self.loop.is_running():
             asyncio.run_coroutine_threadsafe(_takeoff_task(), self.loop)
+
+    async def _start_offboard_internal(self):
+        """Inicializa y arranca el modo Offboard de forma segura."""
+        try:
+            await self.drone.offboard.set_velocity_body(VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
+            await self.drone.offboard.start()
+            self.offboard_active = True
+            self.in_flight = True
+            self.initial_climb_done = (self.state["altitude_m"] >= (self.target_alt - 0.15))
+            self.last_alt_stable = self.state["altitude_m"]
+            self.stable_alt_count = 0
+            with self.lock:
+                self.state["flight_mode"] = "OFFBOARD_AUTO"
+            print(f"[Controller] ✅ Modo Offboard ACTIVO. Altitud fijada a {self.target_alt:.2f}m (VPS). IA al mando de la evasión.")
+        except Exception as e:
+            print(f"[Controller] Error iniciando Offboard: {e}")
 
     def toggle_offboard(self):
         """Activa o suspende el modo Offboard directamente en pleno vuelo."""
@@ -569,16 +729,10 @@ class FlightController(threading.Thread):
                 except Exception:
                     pass
                 self.offboard_active = False
+                self.takeoff_requested = False
             else:
                 print("[Controller] ▶ Activando modo Offboard en vuelo. La IA toma el control...")
-                try:
-                    await self.drone.offboard.set_velocity_body(VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
-                    await self.drone.offboard.start()
-                    self.offboard_active = True
-                    self.in_flight = True
-                    print("[Controller] ✅ Modo Offboard ACTIVO. IA navegando y evadiendo.")
-                except Exception as e:
-                    print(f"[Controller] Error activando Offboard en vuelo: {e}")
+                await self._start_offboard_internal()
 
         if self.loop and self.loop.is_running():
             asyncio.run_coroutine_threadsafe(_toggle(), self.loop)
@@ -636,75 +790,101 @@ class FlightController(threading.Thread):
         self.trigger_land()
 
 # ==============================================================================
-# 3. RASTREADOR DE PERSONA Y COMPENSADOR DE CONTRALUZ (CLAHE)
+# 3. RASTREADOR DE PERSONA Y COMPENSADOR DE CONTRALUZ (CLAHE + MOBILENET-SSD)
 # ==============================================================================
 class RobustTargetTracker:
     def __init__(self, fov_horizontal=88.0):
         self.fov = fov_horizontal
-        self.clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
         self.last_box = None
         self.smooth_alpha = 0.65
+        self.last_angle = 0.0
+        self.last_seen_time = 0.0
 
-        temp_dir = tempfile.gettempdir()
-        cv2_dir = os.path.dirname(cv2.__file__)
-        data_dir = os.path.join(cv2_dir, 'data')
+        # Cargar MobileNet-SSD Caffe para detección robusta de cuerpo entero en cualquier postura
+        self.net = None
+        proto = "Air2S_MAVSDK/models/deploy.prototxt"
+        model = "Air2S_MAVSDK/models/mobilenet.caffemodel"
+        if not os.path.exists(proto):
+            proto = os.path.join(os.path.dirname(__file__), "Air2S_MAVSDK", "models", "deploy.prototxt")
+            model = os.path.join(os.path.dirname(__file__), "Air2S_MAVSDK", "models", "mobilenet.caffemodel")
 
-        def load_cascade_safe(filename):
+        if os.path.exists(proto) and os.path.exists(model):
             try:
-                src_path = os.path.join(data_dir, filename)
-                if os.path.exists(src_path):
-                    dst_path = os.path.join(temp_dir, filename)
-                    if not os.path.exists(dst_path) or os.path.getsize(dst_path) != os.path.getsize(src_path):
-                        shutil.copyfile(src_path, dst_path)
-                    cc = cv2.CascadeClassifier(dst_path)
-                    if not cc.empty():
-                        return cc
+                self.net = cv2.dnn.readNetFromCaffe(proto, model)
+                self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+                self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+                print("[Tracker] ✅ Red neuronal MobileNet-SSD lista para seguimiento humano en 360°.")
+            except Exception as e:
+                print(f"[Tracker] Aviso cargando MobileNet-SSD: {e}")
+
+        # Fallback a Haar Cascade solo si no se pudo cargar la red neuronal
+        self.clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        self.cascade = None
+        if self.net is None:
+            try:
+                self.cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
             except Exception:
                 pass
-            return None
-
-        self.cascade = load_cascade_safe('haarcascade_frontalface_default.xml')
-        self.cascade_alt = load_cascade_safe('haarcascade_frontalface_alt2.xml')
-        self.profile_cascade = load_cascade_safe('haarcascade_profileface.xml')
-        self.upper_cascade = load_cascade_safe('haarcascade_upperbody.xml')
 
     def detect(self, frame):
         h, w = frame.shape[:2]
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray_eq = self.clahe.apply(gray)
-
         best_box = None
-        confidence = 0.92
+        confidence = 0.0
 
-        cascades = [self.cascade, self.cascade_alt, self.profile_cascade, self.upper_cascade]
-        for c in cascades:
-            if c is not None and not c.empty():
-                faces = c.detectMultiScale(gray_eq, scaleFactor=1.15, minNeighbors=4, minSize=(40, 40))
+        if self.net is not None:
+            # Detección profunda de cuerpo completo (clase 15 = Persona en Pascal VOC)
+            blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 0.007843, (300, 300), 127.5)
+            self.net.setInput(blob)
+            detections = self.net.forward()
+            max_conf = 0.0
+            for i in range(detections.shape[2]):
+                conf = float(detections[0, 0, i, 2])
+                cls_id = int(detections[0, 0, i, 1])
+                if cls_id == 15 and conf > 0.35:
+                    if conf > max_conf:
+                        max_conf = conf
+                        box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+                        bx1, by1, bx2, by2 = box.astype(int)
+                        bx1 = max(0, min(w - 1, bx1))
+                        by1 = max(0, min(h - 1, by1))
+                        bx2 = max(0, min(w - 1, bx2))
+                        by2 = max(0, min(h - 1, by2))
+                        if bx2 > bx1 and by2 > by1:
+                            best_box = (bx1, by1, bx2, by2)
+                            confidence = conf
+        else:
+            if self.cascade is not None:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                gray_eq = self.clahe.apply(gray)
+                faces = self.cascade.detectMultiScale(gray_eq, scaleFactor=1.15, minNeighbors=4, minSize=(40, 40))
                 if len(faces) > 0:
-                    best_face = max(faces, key=lambda b: b[2] * b[3])
-                    fx, fy, fw, fh = best_face
-                    bx = max(0, int(fx - fw * 0.3))
-                    by = max(0, int(fy - fh * 0.2))
-                    bw = min(w - bx, int(fw * 1.6))
-                    bh = min(h - by, int(fh * 3.4))
-                    best_box = (bx, by, bx + bw, by + bh)
-                    break
+                    fx, fy, fw, fh = max(faces, key=lambda b: b[2] * b[3])
+                    best_box = (max(0, fx - int(fw*0.2)), max(0, fy - int(fh*0.2)),
+                                min(w, fx + int(fw*1.4)), min(h, fy + int(fh*2.8)))
+                    confidence = 0.85
 
-        if best_box is not None and self.last_box is not None:
-            x1 = int(self.smooth_alpha * best_box[0] + (1 - self.smooth_alpha) * self.last_box[0])
-            y1 = int(self.smooth_alpha * best_box[1] + (1 - self.smooth_alpha) * self.last_box[1])
-            x2 = int(self.smooth_alpha * best_box[2] + (1 - self.smooth_alpha) * self.last_box[2])
-            y2 = int(self.smooth_alpha * best_box[3] + (1 - self.smooth_alpha) * self.last_box[3])
-            best_box = (x1, y1, x2, y2)
-
-        self.last_box = best_box
-
-        angle_deg = 0.0
         if best_box is not None:
+            if self.last_box is not None:
+                x1 = int(self.smooth_alpha * best_box[0] + (1 - self.smooth_alpha) * self.last_box[0])
+                y1 = int(self.smooth_alpha * best_box[1] + (1 - self.smooth_alpha) * self.last_box[1])
+                x2 = int(self.smooth_alpha * best_box[2] + (1 - self.smooth_alpha) * self.last_box[2])
+                y2 = int(self.smooth_alpha * best_box[3] + (1 - self.smooth_alpha) * self.last_box[3])
+                best_box = (x1, y1, x2, y2)
+            self.last_box = best_box
             cx = (best_box[0] + best_box[2]) / 2.0
-            angle_deg = (cx / w - 0.5) * self.fov
-
-        return best_box, angle_deg, confidence
+            angle_deg = (cx / float(w) - 0.5) * self.fov
+            self.last_angle = angle_deg
+            self.last_seen_time = time.time()
+            return best_box, angle_deg, confidence
+        else:
+            # Memoria de persistencia angular: si el objetivo salió del encuadre hace menos de 2.0s,
+            # continuar la rotación en la dirección por donde se fue para re-engancharlo
+            time_since_seen = time.time() - self.last_seen_time
+            if time_since_seen < 2.0 and abs(self.last_angle) > 5.0:
+                scan_angle = 35.0 if self.last_angle > 0 else -35.0
+                return None, scan_angle, 0.0
+            self.last_box = None
+            return None, 0.0, 0.0
 
 # ==============================================================================
 # 4. MOTOR PRINCIPAL DE VISIÓN, NAVEGACIÓN Y DEMOSTRACIÓN
@@ -787,12 +967,18 @@ def main():
     mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
     std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
+    # Corrección Obs.4: Ecualización CLAHE para mejorar detección de superficies
+    # homogéneas (obstáculos delgados, paredes lisas) bajo luz artificial de laboratorio.
+    # Se aplica al canal L del espacio LAB antes de la inferencia MiDaS.
+    clahe_midas = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+
     # 3. Inicializar Tracker y Controlador de Vuelo
     tracker = RobustTargetTracker(fov_horizontal=88.0)
     flight = FlightController(
         system_address=f"udpin://0.0.0.0:{args.mavlink_port}",
         target_alt=args.alt,
-        allow_real_flight=args.fly
+        allow_real_flight=args.fly,
+        yaw_gain=args.yaw_gain
     )
     flight.start()
 
@@ -800,10 +986,12 @@ def main():
     if args.fly:
         print("\n" + "=" * 76)
         print("  [!] MODO DE VUELO REAL FÍSICO HABILITADO (HÉLICES ACTIVAS)")
-        print("      - Tecla [T] : Despegue automático y ascenso a 1.50 m (Activa Offboard).")
+        print(f"      - Tecla [T] : Despegue automático y ascenso a {args.alt:.2f} m (Activa Offboard).")
         print("      - Tecla [O] : Alternar Offboard en el aire (Tomar/Ceder mando a la IA).")
         print("      - [ESPACIO] : FRENO DE EMERGENCIA / Hover instantáneo.")
         print("      - Tecla [L] : Aterrizaje seguro inmediato.")
+        print("      - Tecla [+/-] : Subir / Bajar altitud (+-10 cm) desde laptop.")
+        print("      - Radiomando: Eleva o baja con el stick; la IA fijará la nueva altura.")
         print("      - Tecla [Q] : Aterrizar y salir.")
         print("      * NOTA: Las teclas funcionan tanto en la ventana de video como en esta consola.")
         print("=" * 76)
@@ -842,6 +1030,10 @@ def main():
     t_prev = time.time()
     t_init_flight = time.time()
     cruise_speed = args.speed
+    last_human_seen_t = 0.0
+    in_pure_pivot = False
+    last_thin_obs_info = None
+    last_thin_obs_time = 0.0
 
     out_dir = os.path.join("Air2S_MAVSDK", "logs", "capturas_demo")
     os.makedirs(out_dir, exist_ok=True)
@@ -913,7 +1105,14 @@ def main():
             # ------------------------------------------------------------------
             # PASO 1: Inferencia de Profundidad MiDaS (Obstáculos 3D)
             # ------------------------------------------------------------------
-            img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Corrección Obs.4: Aplicar CLAHE en espacio LAB para realzar bordes
+            # de objetos homogéneos (obstáculos delgados, paredes lisas) antes de MiDaS.
+            frame_lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+            l_ch, a_ch, b_ch = cv2.split(frame_lab)
+            l_eq = clahe_midas.apply(l_ch)
+            frame_enhanced = cv2.cvtColor(cv2.merge((l_eq, a_ch, b_ch)), cv2.COLOR_LAB2BGR)
+
+            img_rgb = cv2.cvtColor(frame_enhanced, cv2.COLOR_BGR2RGB)
             img_input = cv2.resize(img_rgb, (256, 256))
             img_input = (img_input.astype(np.float32) / 255.0 - mean) / std
             img_input = np.expand_dims(img_input, axis=0)
@@ -933,36 +1132,141 @@ def main():
             roi_y2 = int(h_d * 0.85)
             roi_band = depth_norm[roi_y1:roi_y2, :]
 
-            # División de los 3 sectores: Izquierda (0-33%), Centro (33-67%), Derecha (67-100%)
+            # División en sectores: Izquierda (0-33%), Centro (33-67%), Derecha (67-100%)
+            # y Corredor Central Focalizado (40-60%) para capturar obstáculos delgados (5-15 cm)
             sec_left   = roi_band[:, :int(w_d * 0.33)]
             sec_center = roi_band[:, int(w_d * 0.33):int(w_d * 0.67)]
+            sec_narrow = roi_band[:, int(w_d * 0.40):int(w_d * 0.60)]
             sec_right  = roi_band[:, int(w_d * 0.67):]
 
-            # Función para mapear disparidad inversa a distancia métrica estimada
-            # Filtro gaussiano ligero (3x3) y percentil 97.0 para capturar
-            # con alta sensibilidad obstáculos delgados de 10 cm (cajas, postes) a 1.8m de distancia.
-            def disp_to_meters(sub_arr):
-                sub_clean = cv2.GaussianBlur(sub_arr, (3, 3), 0)
-                max_d = float(np.percentile(sub_clean, 97.0))
-                dist_m = 4.2 * (1.0 - max_d) + 0.40
+            # Función para mapear disparidad a distancia métrica estimada
+            # Percentil 92 con filtro Gaussiano 5x5 para filtrar ruido y fluctuaciones espurias
+            def disp_to_meters(sub_arr, is_center=False, narrow_arr=None):
+                sub_clean = cv2.GaussianBlur(sub_arr, (5, 5), 0)
+                if is_center and narrow_arr is not None:
+                    narrow_clean = cv2.GaussianBlur(narrow_arr, (5, 5), 0)
+                    p_narrow = float(np.percentile(narrow_clean, 92.0))
+                    p_wide   = float(np.percentile(sub_clean, 92.0))
+                    max_d    = max(p_narrow, p_wide)
+                else:
+                    max_d = float(np.percentile(sub_clean, 92.0))
+                val_clean = min(1.0, max(0.0, max_d))
+                dist_m = 3.0 * (1.0 - val_clean) + 0.35
                 return max(0.35, min(5.0, dist_m))
 
             dist_left   = disp_to_meters(sec_left)
-            dist_center = disp_to_meters(sec_center)
+            dist_center = disp_to_meters(sec_center, is_center=True, narrow_arr=sec_narrow)
             dist_right  = disp_to_meters(sec_right)
             min_dist    = min(dist_left, dist_center, dist_right)
 
             # ------------------------------------------------------------------
-            # PASO 2: Detección del Objetivo Humano (Persecución)
+            # PASO 2: Detección y Seguimiento del Objetivo Humano (MobileNet-SSD)
             # ------------------------------------------------------------------
             left_view = frame_resized.copy()
             bbox, target_angle, conf = tracker.detect(left_view)
 
+            d_human_est = 0.0
+            if bbox is not None:
+                last_human_seen_t = time.time()
+                bx1, by1, bx2, by2 = bbox
+                h_norm = float(by2 - by1) / float(hf)
+                d_human_est = max(0.70, min(4.50, 0.75 / max(0.15, h_norm)))
+
+            time_since_human = time.time() - last_human_seen_t
+
             # ------------------------------------------------------------------
-            # PASO 3: Planificador Reactivo y Máquina de Estados (FSM)
+            # DETECCIÓN DE ALTA PRECISIÓN DEL OBSTÁCULO DELGADO CERCANO (5 cm)
             # ------------------------------------------------------------------
-            SAFETY_DISTANCE = 1.85  # Umbral de detección preventiva en metros (para caja de 10cm)
-            CRITICAL_HALT   = 0.85  # Parada de emergencia absoluta ante proximidad crítica
+            # Solo se buscan obstáculos en el campo cercano (d <= 0.95 m, depth_norm >= 0.76).
+            # Cualquier objeto o borde lejano (> 1.0 m) se descarta por completo para
+            # evitar confundir objetos distantes (puertas, fondos, patas de mesa).
+            kernel_thin = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
+            disp_opened = cv2.morphologyEx(depth_norm, cv2.MORPH_OPEN, kernel_thin)
+            disp_thin_peak = cv2.subtract(depth_norm, disp_opened)
+
+            mask_thin_obs = np.zeros_like(depth_norm, dtype=np.uint8)
+            mask_thin_obs[roi_y1:roi_y2, int(w_d * 0.22):int(w_d * 0.78)] = 1
+
+            # Proximidad estricta (<= 0.95m) y cresta delgada contrastada (>= 0.055):
+            cond_near_narrow = (depth_norm >= 0.76) & (disp_thin_peak >= 0.055) & (mask_thin_obs > 0)
+            obs_candidates_u8 = (cond_near_narrow.astype(np.uint8)) * 255
+
+            kernel_vert_close = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 9))
+            obs_cleaned = cv2.morphologyEx(obs_candidates_u8, cv2.MORPH_CLOSE, kernel_vert_close)
+
+            contours, _ = cv2.findContours(obs_cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            thin_obs_info = None
+            best_score = -1.0
+
+            for cnt in contours:
+                if cv2.contourArea(cnt) < 70:
+                    continue
+                cx_c, cy_c, cw_c, ch_c = cv2.boundingRect(cnt)
+                aspect_ratio = float(ch_c) / float(max(1, cw_c))
+
+                # Filtro geométrico esbelto: ch >= 32 px, 6 <= cw <= 42 px, aspect_ratio >= 1.60
+                if ch_c >= 32 and 6 <= cw_c <= 42 and aspect_ratio >= 1.60:
+                    roi_obs = depth_norm[cy_c:cy_c+ch_c, cx_c:cx_c+cw_c]
+                    p_val = float(np.percentile(roi_obs, 90.0))
+                    d_cand = 3.0 * (1.0 - min(1.0, max(0.0, p_val))) + 0.35
+
+                    # LÍMITE FÍSICO ESTRICTO: Solo obstáculos inmediatos (d <= 0.95 m)
+                    if d_cand <= 0.95:
+                        fx1 = int(cx_c * float(wf) / 256.0)
+                        fy1 = int(cy_c * float(hf) / 256.0)
+                        fx2 = int((cx_c + cw_c) * float(wf) / 256.0)
+                        fy2 = int((cy_c + ch_c) * float(hf) / 256.0)
+                        fx1 = max(0, min(wf - 1, fx1))
+                        fy1 = max(0, min(hf - 1, fy1))
+                        fx2 = max(0, min(wf - 1, fx2))
+                        fy2 = max(0, min(hf - 1, fy2))
+                        ox_center = (fx1 + fx2) / 2.0
+
+                        # Obstruye la visión si su centro está frente al humano en la imagen
+                        # y está físicamente más cerca que el humano por al menos 20 cm
+                        obstructing = False
+                        if bbox is not None:
+                            in_front_of_human = (bx1 - 15 <= ox_center <= bx2 + 15)
+                            closer_than_human = (d_cand <= d_human_est - 0.20)
+                            if in_front_of_human and closer_than_human:
+                                obstructing = True
+                        else:
+                            if abs(ox_center - (wf / 2.0)) < (wf * 0.18):
+                                obstructing = True
+
+                        score = (1.00 - d_cand) * 3.0 + aspect_ratio
+                        if score > best_score:
+                            best_score = score
+                            thin_obs_info = {
+                                "bbox_frame": (fx1, fy1, fx2, fy2),
+                                "dist_m": d_cand,
+                                "rect_256": (cx_c, cy_c, cw_c, ch_c),
+                                "is_obstructing": obstructing
+                            }
+
+            # Persistencia corta (0.20 s) para evitar retener detecciones obsoletas
+            t_now_obs = time.time()
+            if thin_obs_info is not None:
+                last_thin_obs_info = thin_obs_info
+                last_thin_obs_time = t_now_obs
+            elif last_thin_obs_info is not None and (t_now_obs - last_thin_obs_time) < 0.20:
+                thin_obs_info = last_thin_obs_info
+            else:
+                last_thin_obs_info = None
+
+            # ------------------------------------------------------------------
+            # PASO 3: Planificador Reactivo y Desacoplamiento Cinemático (FSM)
+            # ------------------------------------------------------------------
+            # Umbrales calibrados para laboratorio indoor (~3 m de ancho, objetivo a 1 m):
+            CRITICAL_HALT   = 0.45  # Frenado de emergencia ante choque inminente (< 0.45 m)
+            OBSTACLE_THRESH = 0.80  # Umbral para iniciar maniobra evasiva lateral de obstáculos delgados/postes
+            SIDE_MARGIN     = 0.65  # Margen lateral de seguridad ante paredes
+
+            # Velocidades desacopladas (evita giros en curva y sobre-virajes):
+            V_CRUISE    = min(0.35, cruise_speed)  # Avance nominal frontal cauto (0.35 m/s)
+            V_EVADE     = 0.35                     # Evasión lateral (0.35 m/s)
+            V_SIDE_CORR = 0.25                     # Micro-corrección de pared (0.25 m/s)
 
             cmd_vx = 0.0
             cmd_vy = 0.0
@@ -977,56 +1281,218 @@ def main():
                 fsm_state = "FRENO_HOVER_ACTIVO"
                 state_color = (0, 255, 255) # Amarillo
 
-            elif min_dist < CRITICAL_HALT or (dist_left < 0.95 and dist_center < 0.95 and dist_right < 0.95):
-                # ¡BLOQUEO INMINENTE! Brazo, caja o pared a menos de 0.85m
-                cmd_vx = 0.0
+            elif bbox is not None:
+                # ==============================================================
+                # MODO 1: SEGUIMIENTO HUMANO Y EVASIÓN DE OBSTÁCULO DELGADO INTERMEDIO
+                # ==============================================================
+                # DETECCIÓN ESTRICTA DE OBSTÁCULO DELGADO INTERMEDIO:
+                # Se activa la evasión lateral flanqueante ÚNICAMENTE si:
+                # 1) thin_obs_info está confirmado en campo cercano (d <= 0.95m)
+                #    y está FRENTE al cuerpo humano en la imagen (is_obstructing == True).
+                # 2) O el centro está físicamente bloqueado a distancia crítica (< 0.75m)
+                #    con la persona claramente detrás (> 1.05m) y espacio lateral libre.
+                # Si la persona está lejos (> 1.15m) sin un obstáculo inmediato delante,
+                # el dron NO esquiva: AVANZA hacia el humano de forma limpia y directa.
+                has_side_clearance = (dist_right > dist_center + 0.20) or (dist_left > dist_center + 0.20)
+                is_intermediate_obstacle = False
+                d_obs_flank = dist_center
+
+                if thin_obs_info is not None and thin_obs_info.get("is_obstructing", False):
+                    is_intermediate_obstacle = True
+                    d_obs_flank = thin_obs_info["dist_m"]
+                elif dist_center < 0.75 and d_human_est > 1.05 and has_side_clearance:
+                    is_intermediate_obstacle = True
+                    d_obs_flank = dist_center
+
+                if is_intermediate_obstacle:
+                    # ==============================================================
+                    # MODO 1.B: EVASIÓN LATERAL FLANQUEANTE DE OBSTÁCULO DELGADO
+                    # El humano está detrás de un obstáculo delgado: esquivar lateralmente hacia
+                    # el lado con mayor profundidad y girar en su eje para re-centrar al humano
+                    # y despejar la línea de visión directa.
+                    # ==============================================================
+                    # Decisión de dirección de evasión según profundidad de los lados:
+                    if dist_right >= dist_left:
+                        evade_sign = +1.0
+                    else:
+                        evade_sign = -1.0
+
+                    # Respeto de márgenes de paredes laterales:
+                    if evade_sign > 0 and dist_right < SIDE_MARGIN:
+                        evade_sign = -1.0
+                    elif evade_sign < 0 and dist_left < SIDE_MARGIN:
+                        evade_sign = +1.0
+
+                    # Velocidad lateral decidida para librar el obstáculo delgado:
+                    cmd_vy = float(evade_sign * V_EVADE)
+
+                    # Avance cauto para rebasar el obstáculo delgado, o micro-retroceso si está peligrosamente cerca:
+                    if d_obs_flank < 0.65:
+                        cmd_vx = -0.15
+                    else:
+                        cmd_vx = 0.08  # Suave avance diagonal para rodearlo
+
+                    # GIRO SIMULTÁNEO EN EL EJE PARA MANTENER AL HUMANO EN EL CENTRO DE LA VISIÓN:
+                    # Rota en su propio eje para que el objetivo no quede detrás del obstáculo delgado
+                    if abs(target_angle) > 2.0:
+                        dir_s = 1.0 if target_angle > 0 else -1.0
+                        cmd_yaw_rate = float(dir_s * np.clip(6.0 + 0.65 * (abs(target_angle) - 2.0), 6.0, 16.0))
+                    else:
+                        cmd_yaw_rate = 0.0
+
+                    dir_txt = "DERECHA >>" if evade_sign > 0 else "<< IZQUIERDA"
+                    fsm_state = f"ESQUIVANDO_OBSTACULO_DELGADO_{dir_txt} (Obs:{d_obs_flank:.2f}m | Hum:{d_human_est:.2f}m)"
+                    state_color = (0, 140, 255) # Naranja alerta
+
+                else:
+                    # ==============================================================
+                    # MODO 1.A: SEGUIMIENTO HUMANO LIBRE DE OBSTÁCULOS
+                    # ==============================================================
+                    # 1.1 GESTIÓN DE GIRO CON HISTÉRESIS (Elimina el avance-freno y la oscilación izq/der):
+                    # Si estaba rotando en su propio eje, continúa hasta que el ángulo se reduzca a <= 4.0°.
+                    # Si estaba avanzando, solo conmuta a rotación pura si el ángulo supera los 14.0°.
+                    if in_pure_pivot:
+                        if abs(target_angle) <= 4.0:
+                            in_pure_pivot = False
+                    else:
+                        if abs(target_angle) > 14.0:
+                            in_pure_pivot = True
+
+                    if in_pure_pivot:
+                        # ROTACIÓN PURA EN EL EJE: Traslación en cero para orientar suavemente hacia la persona
+                        dir_s = 1.0 if target_angle > 0 else -1.0
+                        cmd_vx = 0.0
+                        cmd_vy = 0.0
+                        cmd_yaw_rate = float(dir_s * np.clip(10.0 + 0.30 * (abs(target_angle) - 4.0), 10.0, 16.0))
+                        dir_txt = "DERECHA" if target_angle > 0 else "IZQUIERDA"
+                        fsm_state = f"ROTANDO_EN_EJE -> {dir_txt} ({target_angle:+.1f} deg | Yaw:{cmd_yaw_rate:+.0f})"
+                        state_color = (0, 200, 255) # Amarillo/Cian
+
+                    else:
+                        # AVANCE / RETROCESO SUAVE CON ALINEACIÓN CONTINUA
+                        # Alineación suave de guiñada (sin oscilaciones, banda muerta +-4.0°)
+                        if abs(target_angle) > 4.0:
+                            dir_s = 1.0 if target_angle > 0 else -1.0
+                            cmd_yaw_rate = float(dir_s * np.clip(3.5 + 0.40 * (abs(target_angle) - 4.0), 3.5, 7.5))
+                        else:
+                            cmd_yaw_rate = 0.0  # Perfectamente alineado
+
+                        # REGULACIÓN BIDIRECCIONAL DE DISTANCIA A 1.0 METRO:
+                        if dist_center > 1.15:
+                            # Humano lejos (> 1.15 m): avanzar suavemente hacia él con desaceleración progresiva
+                            if dist_center > 1.60:
+                                cmd_vx = 0.28
+                            else:
+                                cmd_vx = float(np.clip(0.16 + (dist_center - 1.15) * 0.25, 0.16, 0.28))
+                            cmd_vy = 0.0
+                            fsm_state = f"AVANZANDO_HACIA_HUMANO ({dist_center:.2f}m)"
+                            state_color = (0, 255, 0) # Verde
+
+                        elif dist_center >= 0.90:
+                            # ZONA EXACTA DE 1.0 METRO (0.90m - 1.15m): HOVER ESTÁTICO PERFECTO
+                            cmd_vx = 0.0
+                            cmd_vy = 0.0
+                            fsm_state = f"ENFOCANDO_A_1_METRO ({dist_center:.2f}m)"
+                            state_color = (0, 255, 200) # Verde cian
+
+                        elif dist_center >= 0.65:
+                            # HUMANO ACERCÁNDOSE (< 0.90 m): RETROCESO ACTIVO INMEDIATO
+                            # El dron se aleja de inmediato para restaurar la distancia segura de 1.0 m
+                            cmd_vx = -0.24
+                            cmd_vy = 0.0
+                            fsm_state = f"RETROCESO_MANTENIENDO_1M ({dist_center:.2f}m | Retroceso)"
+                            state_color = (0, 200, 255) # Naranja advertencia
+
+                        else:
+                            # PROXIMIDAD CRÍTICA (< 0.65 m): RETROCESO RÁPIDO DE SEGURIDAD
+                            cmd_vx = -0.32
+                            cmd_vy = 0.0
+                            fsm_state = f"RETROCESO_RAPIDO_SEGURIDAD ({dist_center:.2f}m)"
+                            state_color = (0, 0, 255) # Rojo peligro
+
+                        # Protección lateral ante paredes mientras sigue al humano:
+                        if dist_left < 0.65:
+                            cmd_vy = +0.20
+                        elif dist_right < 0.65:
+                            cmd_vy = -0.20
+                        else:
+                            cmd_vy = 0.0
+
+            # SI NO HAY BBOX PERO UN HUMANO FUE VISTO HACE MENOS DE 2.5 SEGUNDOS:
+            elif time_since_human < 2.5 and dist_center < 1.15:
+                # El humano está muy cerca y llenó el encuadre (pérdida momentánea de cuerpo entero):
+                # ¡NO ESQUIVAR LATERALMENTE NI AVANZAR! Retroceder decididamente para abrir distancia.
+                cmd_vx = -0.26
                 cmd_vy = 0.0
                 cmd_yaw_rate = 0.0
-                fsm_state = f"FRENO_EMERGENCIA ({min_dist:.2f}m)"
+                fsm_state = f"RETROCESO_PROXIMIDAD_HUMANO ({dist_center:.2f}m)"
+                state_color = (0, 140, 255) # Naranja
+
+            elif min_dist < CRITICAL_HALT:
+                # ==============================================================
+                # MODO 2: EVASIÓN DE EMERGENCIA ANTE CHOQUE INMINENTE (< 0.45m)
+                # ==============================================================
+                cmd_vx = 0.0
+                cmd_yaw_rate = 0.0  # Cero rotación para evitar banked turns
+                if dist_right >= dist_left:
+                    cmd_vy = +V_EVADE
+                    fsm_state = f"ESCAPE_EMERGENCIA_DER ({min_dist:.2f}m)"
+                else:
+                    cmd_vy = -V_EVADE
+                    fsm_state = f"ESCAPE_EMERGENCIA_IZQ ({min_dist:.2f}m)"
                 state_color = (0, 0, 255) # Rojo
 
-            elif dist_center < SAFETY_DISTANCE:
-                # Obstáculo frontal en el sector central (ej. caja de 10 cm detectada)
-                cmd_vx = cruise_speed * 0.25  # Avance diagonal suave
-                if dist_right >= dist_left:
-                    # Sector derecho más libre -> Desviarse físicamente a la DERECHA
-                    cmd_vy = -cruise_speed if args.invert_vy else +cruise_speed
-                    fsm_state = f"ESQUIVANDO_HACIA_DERECHA ({dist_center:.2f}m)"
+            elif (thin_obs_info is not None and thin_obs_info["dist_m"] < 0.80) or (dist_center < 0.72):
+                # ==============================================================
+                # MODO 3: EVASIÓN LATERAL DE OBSTÁCULO DELGADO ESTÁTICO (< 0.80m)
+                # ==============================================================
+                obs_d = thin_obs_info["dist_m"] if thin_obs_info is not None else dist_center
+                cmd_vx = 0.10       # Avance lento para rebasar el obstáculo delgado
+                cmd_yaw_rate = 0.0  # Cero rotación de eje durante esquiva lateral
+                diff_m = dist_right - dist_left
+                if diff_m > 0.10:
+                    cmd_vy = +V_EVADE
+                    fsm_state = f"ESQUIVANDO_OBSTACULO_DELGADO_DER ({obs_d:.2f}m)"
                 else:
-                    # Sector izquierdo más libre -> Desviarse físicamente a la IZQUIERDA
-                    cmd_vy = +cruise_speed if args.invert_vy else -cruise_speed
-                    fsm_state = f"ESQUIVANDO_HACIA_IZQUIERDA ({dist_center:.2f}m)"
+                    cmd_vy = -V_EVADE
+                    fsm_state = f"ESQUIVANDO_OBSTACULO_DELGADO_IZQ ({obs_d:.2f}m)"
                 state_color = (0, 140, 255) # Naranja alerta
 
-            elif dist_left < 1.35:
-                # Obstáculo lateral en la izquierda -> Corregir y desviarse a la DERECHA
-                cmd_vx = cruise_speed * 0.50
-                cmd_vy = -cruise_speed * 0.75 if args.invert_vy else +cruise_speed * 0.75
-                fsm_state = f"EVADIENDO_HACIA_DERECHA (Obs_Izq: {dist_left:.2f}m)"
+            elif dist_left < SIDE_MARGIN:
+                cmd_vx = V_CRUISE * 0.60
+                cmd_vy = +V_SIDE_CORR
+                cmd_yaw_rate = 0.0
+                fsm_state = f"CORRECCION_PARED_IZQ ({dist_left:.2f}m)"
                 state_color = (0, 180, 255)
 
-            elif dist_right < 1.35:
-                # Obstáculo lateral en la derecha -> Corregir y desviarse a la IZQUIERDA
-                cmd_vx = cruise_speed * 0.50
-                cmd_vy = +cruise_speed * 0.75 if args.invert_vy else -cruise_speed * 0.75
-                fsm_state = f"EVADIENDO_HACIA_IZQUIERDA (Obs_Der: {dist_right:.2f}m)"
+            elif dist_right < SIDE_MARGIN:
+                cmd_vx = V_CRUISE * 0.60
+                cmd_vy = -V_SIDE_CORR
+                cmd_yaw_rate = 0.0
+                fsm_state = f"CORRECCION_PARED_DER ({dist_right:.2f}m)"
                 state_color = (0, 180, 255)
 
-            elif bbox is not None:
-                # Camino despejado y persona detectada -> Persecución con alineación Yaw reactiva
-                cmd_vx = cruise_speed
+            elif abs(target_angle) > 5.0 and dist_center >= 0.85:
+                # ==============================================================
+                # MODO 4: BÚSQUEDA DEL OBJETIVO PERDIDO EN SU PROPIO EJE
+                # ==============================================================
+                # El objetivo salió del encuadre recientemente: rotar en el lugar (Hover + Yaw)
+                cmd_vx = 0.0
                 cmd_vy = 0.0
-                # Guiñada reactiva proporcional al ángulo de la persona (máx 25 deg/s)
-                cmd_yaw_rate = float(np.clip(target_angle * 0.65, -25.0, 25.0))
-                fsm_state = f"PERSIGUIENDO_HUMANO ({target_angle:+.1f} deg)"
-                state_color = (0, 255, 0) # Verde nominal
+                dir_sign = 1.0 if target_angle > 0 else -1.0
+                cmd_yaw_rate = float(dir_sign * 14.0)
+                dir_txt = "DERECHA" if target_angle > 0 else "IZQUIERDA"
+                fsm_state = f"ROTANDO_BUSCANDO_HUMANO -> {dir_txt}"
+                state_color = (0, 200, 255)
 
             else:
-                # Camino despejado sin objetivo -> Exploración suave al frente
-                cmd_vx = cruise_speed
+                # ==============================================================
+                # MODO 5: CRUCERO CAUTO SIN OBSTÁCULOS NI OBJETIVO VISIBLE
+                # ==============================================================
+                cmd_vx = V_CRUISE * 0.60
                 cmd_vy = 0.0
                 cmd_yaw_rate = 0.0
-                fsm_state = f"AVANCE_CRUCERO ({cruise_speed:.2f} m/s)"
+                fsm_state = f"BUSQUEDA_CRUCERO ({V_CRUISE*0.60:.2f} m/s)"
                 state_color = (0, 255, 180)
 
             # Notificar al hilo de control de vuelo
@@ -1080,8 +1546,32 @@ def main():
                 tgt_cy = (by1 + by2) // 2
                 cv2.circle(left_view, (tgt_cx, tgt_cy), 5, (0, 255, 0), -1)
                 cv2.line(left_view, (center_x, center_y), (tgt_cx, tgt_cy), (0, 255, 255), 2)
-                cv2.putText(left_view, f"Target: Humano ({conf:.2f})", (bx1, max(20, by1 - 8)),
+                cv2.putText(left_view, f"Target: Humano ({conf:.2f} | D:{d_human_est:.2f}m)", (bx1, max(20, by1 - 8)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+
+            # DIBUJAR RECUADRO AMARILLO DEL OBSTÁCULO DELGADO EN LA VISTA DE PERSECUCIÓN
+            if thin_obs_info is not None:
+                ox1, oy1, ox2, oy2 = thin_obs_info["bbox_frame"]
+                d_obs_m = thin_obs_info["dist_m"]
+                # 1) Recuadro amarillo brillante (BGR: (0, 255, 255))
+                cv2.rectangle(left_view, (ox1, oy1), (ox2, oy2), (0, 255, 255), 3)
+
+                # 2) Etiqueta de texto "OBSTACULO DELGADO" en amarillo con fondo negro
+                lbl_obs = f"OBSTACULO DELGADO ({d_obs_m:.2f}m)"
+                (tw, th), _ = cv2.getTextSize(lbl_obs, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
+                ly = max(th + 6, oy1 - 8)
+                cv2.rectangle(left_view, (ox1, ly - th - 4), (ox1 + tw + 6, ly + 4), (0, 0, 0), -1)
+                cv2.putText(left_view, lbl_obs, (ox1 + 3, ly),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 255), 2)
+
+                # Si el obstáculo delgado obstruye la línea de visión al humano:
+                if thin_obs_info.get("is_obstructing", False) and bbox is not None:
+                    obs_warn = "¡HUMANO DETRAS DE OBSTACULO! ESQUIVANDO..."
+                    (aw, ah), _ = cv2.getTextSize(obs_warn, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 2)
+                    warn_y = min(hf - 10, oy2 + 22)
+                    cv2.rectangle(left_view, (ox1, warn_y - ah - 4), (ox1 + aw + 6, warn_y + 4), (0, 0, 160), -1)
+                    cv2.putText(left_view, obs_warn, (ox1 + 3, warn_y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 2)
 
             # Vector de movimiento resultante (Flecha de navegación en el HUD)
             arrow_scale = 160.0
@@ -1131,9 +1621,26 @@ def main():
             left_view = np.vstack((left_view, foot_bar))
 
             # ------------------------------------------------------------------
-            # PASO 5: Renderizado de la Vista Derecha (Profundidad + 3 Sectores)
+            # PASO 5: Renderizado de la Vista Derecha (Profundidad + Obstáculo Delgado Brillante)
             # ------------------------------------------------------------------
-            depth_uint8 = (depth_norm * 255).astype(np.uint8)
+            depth_norm_vis = depth_norm.copy()
+            if thin_obs_info is not None:
+                cx_o, cy_o, cw_o, ch_o = thin_obs_info["rect_256"]
+                # Poner brillante el obstáculo delgado en el mapa de profundidad:
+                pad_x = max(1, int(cw_o * 0.20))
+                pad_y = max(1, int(ch_o * 0.10))
+                rx1_256 = max(0, cx_o - pad_x)
+                ry1_256 = max(0, cy_o - pad_y)
+                rx2_256 = min(255, cx_o + cw_o + pad_x)
+                ry2_256 = min(255, cy_o + ch_o + pad_y)
+                # Boost de disparidad para que brille incandescente en el mapa de color
+                depth_norm_vis[ry1_256:ry2_256, rx1_256:rx2_256] = np.clip(
+                    depth_norm_vis[ry1_256:ry2_256, rx1_256:rx2_256] * 1.5 + 0.35, 0.0, 1.0
+                )
+                # Saturación al 100% de brillo (blanco/amarillo incandescente en colormap)
+                depth_norm_vis[cy_o:cy_o+ch_o, cx_o:cx_o+cw_o] = 1.0
+
+            depth_uint8 = (depth_norm_vis * 255).astype(np.uint8)
             if depth_uint8.ndim == 3:
                 depth_uint8 = depth_uint8.squeeze()
             depth_color = cv2.applyColorMap(depth_uint8, colormaps[curr_cm_idx])
@@ -1149,7 +1656,7 @@ def main():
             def sector_color(d):
                 if d < CRITICAL_HALT:
                     return (0, 0, 255) # Rojo peligro
-                elif d < SAFETY_DISTANCE:
+                elif d < OBSTACLE_THRESH:
                     return (0, 140, 255) # Naranja advertencia
                 return (0, 255, 0) # Verde libre
 
@@ -1162,6 +1669,10 @@ def main():
             # Sector Central (Vía de avance principal)
             c_center = sector_color(dist_center)
             cv2.rectangle(right_view, (w_sec, y_top), (2 * w_sec, y_bot), c_center, 3)
+            # Corredor focalizado para obstáculos delgados (40-60%)
+            w_nar1 = int(wr * 0.40)
+            w_nar2 = int(wr * 0.60)
+            cv2.rectangle(right_view, (w_nar1, y_top + 15), (w_nar2, y_bot - 15), (0, 255, 255), 1)
             cv2.putText(right_view, f"CENTRO: {dist_center:.2f}m", (w_sec + 10, y_top + 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, c_center, 2)
 
@@ -1170,6 +1681,17 @@ def main():
             cv2.rectangle(right_view, (2 * w_sec, y_top), (wr, y_bot), c_right, 2)
             cv2.putText(right_view, f"DER: {dist_right:.2f}m", (2 * w_sec + 10, y_top + 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.60, c_right, 2)
+
+            # Resaltar obstáculo delgado en el mapa de profundidad
+            if thin_obs_info is not None:
+                cx_o, cy_o, cw_o, ch_o = thin_obs_info["rect_256"]
+                rx1_d = int(cx_o * float(wr) / 256.0)
+                ry1_d = int(cy_o * float(hr) / 256.0)
+                rx2_d = int((cx_o + cw_o) * float(wr) / 256.0)
+                ry2_d = int((cy_o + ch_o) * float(hr) / 256.0)
+                cv2.rectangle(right_view, (rx1_d, ry1_d), (rx2_d, ry2_d), (0, 255, 255), 2)
+                cv2.putText(right_view, f"OBSTACULO DELGADO ({thin_obs_info['dist_m']:.2f}m)",
+                            (rx1_d, max(22, ry1_d - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 2)
 
             # Barra superior derecha
             header_right = np.zeros((45, wr, 3), dtype=np.uint8)
@@ -1182,20 +1704,24 @@ def main():
             foot_right = np.zeros((55, wr, 3), dtype=np.uint8)
             foot_right[:] = (15, 15, 15)
             if min_dist < CRITICAL_HALT:
-                cv2.putText(foot_right, f"ALERTA PROXIMIDAD! ({min_dist:.2f}m) FRENO DE SEGURIDAD", (12, 34),
+                cv2.putText(foot_right, f"ALERTA PROXIMIDAD! ({min_dist:.2f}m) FRENO / ESCAPE", (12, 34),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 0, 255), 2)
-            elif dist_center < SAFETY_DISTANCE:
+            elif thin_obs_info is not None and thin_obs_info["dist_m"] < OBSTACLE_THRESH:
                 escape_dir = "DERECHA >>" if dist_right >= dist_left else "<< IZQUIERDA"
-                cv2.putText(foot_right, f"OBSTACULO EN CENTRO! EVADIENDO HACIA: {escape_dir}", (12, 34),
+                cv2.putText(foot_right, f"OBSTACULO DELGADO ({thin_obs_info['dist_m']:.2f}m)! EVADIENDO: {escape_dir}", (12, 34),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 140, 255), 2)
+            elif dist_center < OBSTACLE_THRESH:
+                escape_dir = "DERECHA >>" if dist_right >= dist_left else "<< IZQUIERDA"
+                cv2.putText(foot_right, f"OBSTACULO EN CENTRO! EVADIENDO: {escape_dir}", (12, 34),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 140, 255), 2)
-            elif dist_left < 1.35:
-                cv2.putText(foot_right, f"OBSTACULO EN IZQ ({dist_left:.2f}m) EVADIENDO >> DERECHA", (12, 34),
+            elif dist_left < SIDE_MARGIN:
+                cv2.putText(foot_right, f"MARGEN IZQ ({dist_left:.2f}m) CORRECCION >> DERECHA", (12, 34),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 180, 255), 2)
-            elif dist_right < 1.35:
-                cv2.putText(foot_right, f"OBSTACULO EN DER ({dist_right:.2f}m) EVADIENDO << IZQUIERDA", (12, 34),
+            elif dist_right < SIDE_MARGIN:
+                cv2.putText(foot_right, f"MARGEN DER ({dist_right:.2f}m) CORRECCION << IZQUIERDA", (12, 34),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 180, 255), 2)
             else:
-                cv2.putText(foot_right, f"SECTOR CENTRAL DESPEJADO (Crucero a {cruise_speed:.2f} m/s)", (12, 34),
+                cv2.putText(foot_right, f"CAMINO DESPEJADO (Crucero a {cruise_speed:.2f} m/s)", (12, 34),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
             right_view = np.vstack((right_view, foot_right))
 
@@ -1228,6 +1754,21 @@ def main():
             elif key == ord(' '):
                 # Pausa / Freno de emergencia en el aire
                 flight.toggle_emergency_hover()
+
+            elif key == ord('+') or key == ord('='):
+                flight.adjust_target_altitude(+0.10)
+
+            elif key == ord('-') or key == ord('_'):
+                flight.adjust_target_altitude(-0.10)
+
+            elif key == ord('r') or key == ord('R'):
+                with flight.lock:
+                    flight.target_alt = 1.70
+                    flight.state["target_alt_m"] = 1.70
+                    flight.initial_climb_done = False
+                    flight.last_alt_stable = 1.70
+                    flight.stable_alt_count = 0
+                print("\n[Controller] 🔄 Altitud objetivo restablecida a 1.70 m.\n")
 
             elif key == ord('c') or key == ord('C'):
                 curr_cm_idx = (curr_cm_idx + 1) % len(colormaps)

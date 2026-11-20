@@ -1391,11 +1391,26 @@ def main():
             bbox, target_angle, conf = tracker.detect(left_view)
 
             d_human_est = 0.0
+            d_target = 0.0
             if bbox is not None:
                 last_human_seen_t = time.time()
                 bx1, by1, bx2, by2 = bbox
                 h_norm = float(by2 - by1) / float(hf)
-                d_human_est = max(0.70, min(4.50, 0.75 / max(0.15, h_norm)))
+                d_human_est = max(0.65, min(4.50, 0.75 / max(0.15, h_norm)))
+
+                # Medición de profundidad localizada en la región del cuerpo del humano en MiDaS
+                bx1_d = max(0, min(255, int(bx1 * 256.0 / float(wf))))
+                bx2_d = max(0, min(255, int(bx2 * 256.0 / float(wf))))
+                by1_d = max(0, min(255, int(by1 * 256.0 / float(hf))))
+                by2_d = max(0, min(255, int(by2 * 256.0 / float(hf))))
+                roi_hum_depth = depth_norm[by1_d:by2_d, bx1_d:bx2_d]
+                if roi_hum_depth.size > 0:
+                    p_hum = float(np.percentile(roi_hum_depth, 85.0))
+                    d_hum_midas = 3.0 * (1.0 - min(1.0, max(0.0, p_hum))) + 0.35
+                    d_hum_midas = max(0.35, min(5.0, d_hum_midas))
+                    d_target = float(np.clip(0.55 * d_hum_midas + 0.45 * d_human_est, 0.40, 4.50))
+                else:
+                    d_target = d_human_est
 
             time_since_human = time.time() - last_human_seen_t
 
@@ -1573,66 +1588,59 @@ def main():
                     # ==============================================================
                     # MODO 1.A: SEGUIMIENTO HUMANO LIBRE DE OBSTÁCULOS
                     # ==============================================================
-                    # 1.1 GESTIÓN DE GIRO CON HISTÉRESIS (Elimina el avance-freno y la oscilación izq/der):
-                    # Si estaba rotando en su propio eje, continúa hasta que el ángulo se reduzca a <= 4.0°.
-                    # Si estaba avanzando, solo conmuta a rotación pura si el ángulo supera los 14.0°.
-                    if in_pure_pivot:
-                        if abs(target_angle) <= 4.0:
-                            in_pure_pivot = False
-                    else:
-                        if abs(target_angle) > 14.0:
-                            in_pure_pivot = True
-
-                    if in_pure_pivot:
-                        # ROTACIÓN PURA EN EL EJE: Traslación en cero para orientar suavemente hacia la persona
+                    # 1. CÁLCULO DE GUIÑADA PROPORCIONAL Y DINÁMICA EN EL EJE:
+                    # Siempre rota en su propio eje para mantener al piloto centrado
+                    if abs(target_angle) > 2.5:
                         dir_s = 1.0 if target_angle > 0 else -1.0
+                        # Escala ágil de giro en el eje: 5.0 a 24.0 deg/s
+                        cmd_yaw_rate = float(dir_s * np.clip(5.0 + 0.85 * (abs(target_angle) - 2.5), 5.0, 24.0))
+                        dir_txt = "DERECHA" if target_angle > 0 else "IZQUIERDA"
+                    else:
+                        cmd_yaw_rate = 0.0
+                        dir_txt = "CENTRO"
+
+                    # 2. REGLA DE ORO ANTI-SOBREPASO (NO PASARSE DE LARGO):
+                    # Si el piloto está desalineado (> 6.0°), PRIORIZAR ROTACIÓN PURA EN EL EJE.
+                    # Quedarse estático en el lugar (cmd_vx = 0, cmd_vy = 0) para orientar el morro hacia él.
+                    if abs(target_angle) > 6.0:
                         cmd_vx = 0.0
                         cmd_vy = 0.0
-                        cmd_yaw_rate = float(dir_s * np.clip(10.0 + 0.30 * (abs(target_angle) - 4.0), 10.0, 16.0))
-                        dir_txt = "DERECHA" if target_angle > 0 else "IZQUIERDA"
-                        fsm_state = f"ROTANDO_EN_EJE -> {dir_txt} ({target_angle:+.1f} deg | Yaw:{cmd_yaw_rate:+.0f})"
+                        fsm_state = f"ROTANDO_EN_EJE -> {dir_txt} ({target_angle:+.1f} deg | D:{d_target:.2f}m)"
                         state_color = (0, 200, 255) # Amarillo/Cian
 
                     else:
-                        # AVANCE / RETROCESO SUAVE CON ALINEACIÓN CONTINUA
-                        # Alineación suave de guiñada (sin oscilaciones, banda muerta +-4.0°)
-                        if abs(target_angle) > 4.0:
-                            dir_s = 1.0 if target_angle > 0 else -1.0
-                            cmd_yaw_rate = float(dir_s * np.clip(3.5 + 0.40 * (abs(target_angle) - 4.0), 3.5, 7.5))
-                        else:
-                            cmd_yaw_rate = 0.0  # Perfectamente alineado
-
-                        # REGULACIÓN BIDIRECCIONAL DE DISTANCIA A 1.0 METRO:
-                        if dist_center > 1.15:
-                            # Humano lejos (> 1.15 m): avanzar suavemente hacia él con desaceleración progresiva
-                            if dist_center > 1.60:
-                                cmd_vx = 0.28
+                        # 3. REGULACIÓN BIDIRECCIONAL DE DISTANCIA A 1.0 METRO (PILOTO CENTRADO <= 6.0°):
+                        # Se usa d_target (la distancia real calculada en el recuadro del humano)
+                        if d_target > 1.25:
+                            # Humano lejos (> 1.25 m): avanzar suavemente hacia él con desaceleración progresiva
+                            if d_target > 1.80:
+                                cmd_vx = 0.26
                             else:
-                                cmd_vx = float(np.clip(0.16 + (dist_center - 1.15) * 0.25, 0.16, 0.28))
+                                cmd_vx = float(np.clip(0.14 + (d_target - 1.25) * 0.20, 0.14, 0.26))
                             cmd_vy = 0.0
-                            fsm_state = f"AVANZANDO_HACIA_HUMANO ({dist_center:.2f}m)"
+                            fsm_state = f"AVANZANDO_HACIA_PILOTO ({d_target:.2f}m)"
                             state_color = (0, 255, 0) # Verde
 
-                        elif dist_center >= 0.90:
-                            # ZONA EXACTA DE 1.0 METRO (0.90m - 1.15m): HOVER ESTÁTICO PERFECTO
+                        elif d_target >= 0.90:
+                            # ZONA EXACTA DE 1.0 METRO (0.90m - 1.25m): HOVER ESTÁTICO PERFECTO
                             cmd_vx = 0.0
                             cmd_vy = 0.0
-                            fsm_state = f"ENFOCANDO_A_1_METRO ({dist_center:.2f}m)"
+                            fsm_state = f"ENFOCANDO_PILOTO_1M ({d_target:.2f}m | Yaw:{cmd_yaw_rate:+.0f})"
                             state_color = (0, 255, 200) # Verde cian
 
-                        elif dist_center >= 0.65:
+                        elif d_target >= 0.65:
                             # HUMANO ACERCÁNDOSE (< 0.90 m): RETROCESO ACTIVO INMEDIATO
                             # El dron se aleja de inmediato para restaurar la distancia segura de 1.0 m
                             cmd_vx = -0.24
                             cmd_vy = 0.0
-                            fsm_state = f"RETROCESO_MANTENIENDO_1M ({dist_center:.2f}m | Retroceso)"
+                            fsm_state = f"RETROCESO_MANTENIENDO_1M ({d_target:.2f}m | Retroceso)"
                             state_color = (0, 200, 255) # Naranja advertencia
 
                         else:
                             # PROXIMIDAD CRÍTICA (< 0.65 m): RETROCESO RÁPIDO DE SEGURIDAD
                             cmd_vx = -0.32
                             cmd_vy = 0.0
-                            fsm_state = f"RETROCESO_RAPIDO_SEGURIDAD ({dist_center:.2f}m)"
+                            fsm_state = f"RETROCESO_RAPIDO_SEGURIDAD ({d_target:.2f}m)"
                             state_color = (0, 0, 255) # Rojo peligro
 
                         # Protección lateral ante paredes mientras sigue al humano:
@@ -1644,14 +1652,23 @@ def main():
                             cmd_vy = 0.0
 
             # SI NO HAY BBOX PERO UN HUMANO FUE VISTO HACE MENOS DE 2.5 SEGUNDOS:
-            elif time_since_human < 2.5 and dist_center < 1.15:
-                # El humano está muy cerca y llenó el encuadre (pérdida momentánea de cuerpo entero):
-                # ¡NO ESQUIVAR LATERALMENTE NI AVANZAR! Retroceder decididamente para abrir distancia.
-                cmd_vx = -0.26
-                cmd_vy = 0.0
-                cmd_yaw_rate = 0.0
-                fsm_state = f"RETROCESO_PROXIMIDAD_HUMANO ({dist_center:.2f}m)"
-                state_color = (0, 140, 255) # Naranja
+            elif time_since_human < 2.5:
+                # Si estaba muy cerca (< 1.15 m), retroceder decididamente para abrir encuadre
+                if dist_center < 1.15:
+                    cmd_vx = -0.26
+                    cmd_vy = 0.0
+                    cmd_yaw_rate = 0.0
+                    fsm_state = f"RETROCESO_PROXIMIDAD_HUMANO ({dist_center:.2f}m)"
+                    state_color = (0, 140, 255) # Naranja
+                else:
+                    # Si no estaba tan cerca, rotar en su propio eje para re-engancharlo (¡NUNCA avanzar a ciegas!)
+                    cmd_vx = 0.0
+                    cmd_vy = 0.0
+                    dir_sign = 1.0 if target_angle > 0 else -1.0
+                    cmd_yaw_rate = float(dir_sign * 14.0)
+                    dir_txt = "DERECHA" if target_angle > 0 else "IZQUIERDA"
+                    fsm_state = f"ROTANDO_BUSCANDO_PILOTO -> {dir_txt}"
+                    state_color = (0, 200, 255)
 
             elif min_dist < CRITICAL_HALT:
                 # ==============================================================
@@ -1684,14 +1701,14 @@ def main():
                 state_color = (0, 140, 255) # Naranja alerta
 
             elif dist_left < SIDE_MARGIN:
-                cmd_vx = V_CRUISE * 0.60
+                cmd_vx = 0.0
                 cmd_vy = +V_SIDE_CORR
                 cmd_yaw_rate = 0.0
                 fsm_state = f"CORRECCION_PARED_IZQ ({dist_left:.2f}m)"
                 state_color = (0, 180, 255)
 
             elif dist_right < SIDE_MARGIN:
-                cmd_vx = V_CRUISE * 0.60
+                cmd_vx = 0.0
                 cmd_vy = -V_SIDE_CORR
                 cmd_yaw_rate = 0.0
                 fsm_state = f"CORRECCION_PARED_DER ({dist_right:.2f}m)"
@@ -1701,23 +1718,22 @@ def main():
                 # ==============================================================
                 # MODO 4: BÚSQUEDA DEL OBJETIVO PERDIDO EN SU PROPIO EJE
                 # ==============================================================
-                # El objetivo salió del encuadre recientemente: rotar en el lugar (Hover + Yaw)
                 cmd_vx = 0.0
                 cmd_vy = 0.0
                 dir_sign = 1.0 if target_angle > 0 else -1.0
                 cmd_yaw_rate = float(dir_sign * 14.0)
                 dir_txt = "DERECHA" if target_angle > 0 else "IZQUIERDA"
-                fsm_state = f"ROTANDO_BUSCANDO_HUMANO -> {dir_txt}"
+                fsm_state = f"ROTANDO_BUSCANDO_PILOTO -> {dir_txt}"
                 state_color = (0, 200, 255)
 
             else:
                 # ==============================================================
-                # MODO 5: CRUCERO CAUTO SIN OBSTÁCULOS NI OBJETIVO VISIBLE
+                # MODO 5: HOVER CALMO EN ESPERA (Evita que el dron vuele solo hacia paredes)
                 # ==============================================================
-                cmd_vx = V_CRUISE * 0.60
+                cmd_vx = 0.0
                 cmd_vy = 0.0
                 cmd_yaw_rate = 0.0
-                fsm_state = f"BUSQUEDA_CRUCERO ({V_CRUISE*0.60:.2f} m/s)"
+                fsm_state = "EN_ESPERA_HOVER (Piloto no detectado)"
                 state_color = (0, 255, 180)
 
             # Notificar al hilo de control de vuelo
@@ -1784,7 +1800,7 @@ def main():
                     # PILOTO BLOQUEADO: Color Cian Neón (255, 255, 0) con esquinas tipo mira
                     box_color = (255, 255, 0)
                     sim_pct = int(tracker.pilot_similarity * 100)
-                    lbl_tgt = f"PILOTO [BLOQUEADO] ({sim_pct}% | D:{d_human_est:.2f}m)"
+                    lbl_tgt = f"PILOTO [BLOQUEADO] ({sim_pct}% | D:{d_target:.2f}m)"
                     cv2.rectangle(left_view, (bx1, by1), (bx2, by2), box_color, 2)
                     corner_len = max(8, min(20, min((bx2-bx1)//4, (by2-by1)//4)))
                     cv2.line(left_view, (bx1, by1), (bx1 + corner_len, by1), (0, 255, 255), 3)
@@ -1798,7 +1814,7 @@ def main():
                 else:
                     # MODO LIBRE: Color Verde indicando tecla 'B'
                     box_color = (0, 255, 0)
-                    lbl_tgt = f"Humano ({conf:.2f} | D:{d_human_est:.2f}m) [Pulsa 'B' para Bloquear]"
+                    lbl_tgt = f"Humano ({conf:.2f} | D:{d_target:.2f}m) [Pulsa 'B' para Bloquear]"
                     cv2.rectangle(left_view, (bx1, by1), (bx2, by2), box_color, 2)
 
                 cv2.circle(left_view, (tgt_cx, tgt_cy), 5, box_color, -1)

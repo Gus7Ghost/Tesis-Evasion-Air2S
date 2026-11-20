@@ -321,3 +321,35 @@
        * `[U]`: Desbloquear objetivo y retornar al modo libre.
        * `[Clic]`: Selección directa por puntero sobre la pantalla.
 
+
+## 13. Prueba 2 de Vuelo (20/11/2026): Validación de Re-ID y Corrección del Sobre-Paso Frontal por Desacople de Medición de Fondo
+* **Archivo de telemetría analizado:**
+  * `Air2S_MAVSDK/logs/metricas_vuelo_20261120_152330.csv` (1897 ciclos, duración total: $284.89\text{ s}$).
+* **Comprobación Positiva:**
+  * El sistema de identificación y bloqueo semi-automático reconoció y mantuvo identificado al piloto sin fijarse en la gigantografía de la pared, confirmando la eficacia del descriptor de color HSV y Re-ID en tiempo real.
+* **Diagnóstico de la Pérdida de Control, Falta de Giro y Sobre-Paso:**
+  1. **Confusión de Distancia (Uso de Fondo en lugar de la Persona):**
+     * El controlador evaluaba el avance/retroceso respecto a `dist_center` (el tercio central de MiDaS).
+     * Cuando el piloto se desplazaba lateralmente (ángulo $> 6^\circ$, presente en el $61\%$ de los ciclos con detección humana), el centro del encuadre apuntaba a la pared vacía del fondo ($1.8\text{ m} \dots 2.7\text{ m}$).
+     * Como consecuencia, el sistema asumía que la persona estaba muy lejos y ordenaba avance frontal ($v_x = 0.28\text{ m/s}$).
+  2. **Velocidad de Guiñada Insuficiente en Distancia Segura:**
+     * Al estar fuera del modo de pivote puro, la guiñada estaba limitada a solo $3.5^\circ/\text{s} \dots 7.5^\circ/\text{s}$, insuficiente para orbitar a un humano a 1.0 m ($\omega \ge 20^\circ/\text{s}$).
+     * El dron avanzaba frontalmente mientras giraba muy lentamente, pasándose de largo por el costado del piloto y perdiéndolo de vista.
+  3. **Aceleración Ciega en Búsqueda:**
+     * Al perder de vista al objetivo, el estado `BUSQUEDA_CRUCERO` aceleraba el dron hacia adelante a $0.21\text{ m/s}$ (1,000 ciclos), alejándolo aún más en el laboratorio.
+* **Soluciones Implementadas en `prototipo_completo_tesis.py` y `Air2S_MAVSDK/prototipo_completo_tesis.py`:**
+  1. **Medición Localizada de la Distancia al Piloto (`d_target`):**
+     * Se extrae la profundidad dentro del recuadro del humano en MiDaS y se fusiona con la altura geométrica:
+       $d_{\text{target}} = 0.55 \cdot d_{\text{midas\_roi}} + 0.45 \cdot d_{\text{geom}}$.
+     * La regulación de distancia mide estrictamente al piloto, sin importar si está al centro, izquierda o derecha.
+  2. **Regla de Oro Anti-Sobrepaso ($|target\_angle| > 6.0^\circ \implies v_x = 0.0$):**
+     * Si el piloto está descentrado ($> 6.0^\circ$), la velocidad longitudinal se anula estrictamente ($v_x = 0.0, v_y = 0.0$).
+     * El dron se detiene horizontalmente y gira ágilmente sobre su propio eje vertical ($5.0^\circ/\text{s} \dots 24.0^\circ/\text{s}$) hasta recentrar al piloto.
+  3. **Hover Estático a 1.0 m y Retroceso Activo:**
+     * Centrado $\le 6^\circ$ y $0.90\text{ m} \le d \le 1.25\text{ m}$: hover estático absoluto ($v_x = 0.0, v_y = 0.0$).
+     * Aproximación $< 0.90\text{ m}$: retroceso activo inmediato ($v_x = -0.24\text{ m/s}$).
+     * Avance $v_x > 0$ permitido únicamente si el piloto está centrado y se encuentra a $> 1.25\text{ m}$.
+  4. **Hover de Espera en Pérdida:**
+     * Si el piloto sale de cuadro, el dron no avanza hacia las paredes ($v_x = 0.0$), sino que hace hover en el lugar y rota sobre su eje en la última dirección vista para re-engancharlo.
+
+

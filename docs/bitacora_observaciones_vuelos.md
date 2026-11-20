@@ -436,3 +436,22 @@
      * Se incorporó `last_frame_time` en `FreshFrameReader`. Si no ingresa un fotograma fresco por más de 2.0 segundos, el lector reporta pérdida de video y el dron pasa inmediatamente a **`HOVER_VIDEO_DESCONECTADO` estático en el lugar** ($v_x = 0, v_y = 0, \omega = 0$), protegiendo al dron de actuar sobre imágenes estáticas.
   3. **Recomendación Operativa:**
      * En la tablet Android, configurar la pantalla en "Tiempo de espera: Nunca" o "30 minutos" para impedir que Android entre en ahorro de energía y pause el streaming de video de RosettaDrone.
+
+
+## 18. Supresión Total de Detención en Eje y Guiñada Suave Acoplada al Gimbal DJI (20/11/2026)
+* **Reporte del Operador en Vuelo:**
+  * *"Está cometiendo el error de girar su cuerpo sin girar su cámara... no avanza, se queda en su eje."*
+* **Diagnóstico de Telemetría Real (`metricas_vuelo_20261120_164112.csv`, 335 ciclos):**
+  1. **Causa del Giro de Chasis sin Giro de Cámara:**
+     * En el registro se observó que el dron rotó $58^\circ$ de orientación física (`heading_yaw_deg` pasó de $98.7^\circ$ a $156.1^\circ$), mientras que el ángulo del objetivo humano en la imagen permaneció clavado en $+17.5^\circ$.
+     * Esta anomalía fue generada porque velocidades de guiñada elevadas ($\sim 18^\circ/\text{s}$) saturaban el estabilizador de 3 ejes del gimbal del DJI Air 2S, provocando que los motores del gimbal absorbieran el giro en vez de rotar solidariamente con el dron.
+  2. **Causa del Estancamiento en el Eje sin Avance:**
+     * La lógica de `in_pure_pivot` anulaba la velocidad hacia adelante ($v_x = 0.0\text{ m/s}$) tan pronto el ángulo era superior a la banda de histéresis, atrapando al dron en rotación estacionaria sin avanzar hacia el objetivo.
+* **Soluciones Implementadas:**
+  1. **Supresión Definitiva de Detención en Eje (Avance Permanente):**
+     * Se eliminó el modo de pivote puro con avance nulo durante el seguimiento humano.
+     * Siempre que el objetivo esté a distancia $> 1.25\text{ m}$, el dron **AVANZA CONTINUAMENTE ($v_x = 0.28\text{ m/s}$)** en línea directa hacia ti, haciendo imposible que se quede atrapado en el lugar.
+  2. **Guiñada Suave Acoplada al Gimbal ($\le 8.0^\circ/\text{s}$):**
+     * Se acotó la velocidad angular a un máximo suave de $8.0^\circ/\text{s}$ ($3.0^\circ/\text{s} \dots 8.0^\circ/\text{s}$). A esta velocidad, el gimbal mecánico sigue perfectamente al chasis del dron en tiempo real, garantizando que chasis y cámara se muevan siempre como un único bloque sólido.
+  3. **Purga de Métodos Residuales de Gimbal:**
+     * Se eliminó por completo el método residual `_setup_gimbal_pitch()`, asegurando que MAVLink no interfiera con el control de actitud del gimbal.

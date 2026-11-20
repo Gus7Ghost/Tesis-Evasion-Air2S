@@ -304,7 +304,20 @@
   * En una de las paredes del laboratorio se encuentra colocada una **gigantografía/póster de gran tamaño de un científico**.
   * Al ingresar en el campo de visión de la cámara, MobileNet-SSD clasifica la imagen del científico como clase 15 (`person`), debido a que su morfología 2D (cabeza, hombros y torso) satisface plenamente las características convolucionales aprendidas.
   * Dado que el algoritmo seleccionaba el objetivo mediante el criterio de máxima confianza matemática (`conf > max_conf`), la gigantografía (al estar fija, nítida y perfectamente iluminada) generaba un puntaje de confianza superior al del piloto en movimiento, provocando que el dron desenganchara al piloto y se fijara en el póster.
-* **Plan de Acción para Re-Identificación Exclusiva del Piloto (Target Re-ID):**
-  * Se descarta la necesidad de entrenar un dataset masivo o pesado desde cero (ineficiente, dependiente del vestuario y de alto costo computacional).
-  * Se establece la implementación de una **Firma de Apariencia en Tiempo Real (HSV Color Signature)** combinada con **Enclavamiento Espacial de Continuidad (Target Lock por IoU/Centroide)** y **Filtro de Relieve MiDaS contra Superficie de Pared**, garantizando que el dron discrimine y persiga únicamente al piloto sin ser engañado por representaciones fotográficas 2D en paredes.
+* **Plan de Acción e Implementación de la Solución (Target Re-ID Semi-Automático con Tecla):**
+  * Se descartó la necesidad de entrenar un dataset masivo desde cero (ineficiente, dependiente del vestuario y de alto costo computacional).
+  * **Solución Implementada en Código (`prototipo_completo_tesis.py`):**
+    1. **Bloqueo Semi-Automático por Tecla (`B`, `K`, `P`) y Clic en Pantalla:**
+       * El piloto se ubica en el centro de la cámara y pulsa la tecla `B` (o hace clic sobre su figura en la ventana).
+       * El sistema adquiere el bloqueo (`is_locked = True`) y computa un histograma de color HSV tridimensional $[8, 8, 8]$ normalizado en $L_1$ del torso del piloto.
+    2. **Discriminación de Gigantografía por Distancia de Bhattacharyya e IoU Espacial:**
+       * Para cada candidato detectado en escena, se evalúa:
+         $$\text{Sim}_{\text{color}} = 1.0 - \text{cv2.compareHist}(H_{\text{piloto}}, H_{\text{cand}}, \text{cv2.HISTCMP\_BHATTACHARYYA})$$
+         $$\text{Score} = 0.60 \times \text{Sim}_{\text{color}} + 0.40 \times \text{ContinuidadEspacial}$$
+       * La gigantografía del científico (al presentar vestimenta y reflectancia distinta) arroja una similitud prácticamente nula ($\le 0.05$) y es clasificada como **`DESCARTADO: Gigantografia/Falso Humano`**, mostrándose en recuadro tenue en el HUD.
+       * El piloto mantiene similitud $\ge 0.70$ y es seguido exclusivamente con recuadro **Cian Neón con esquinas de mira (`PILOTO [BLOQUEADO]`)**.
+    3. **Teclas de Control y Desbloqueo:**
+       * `[B]`: Bloquear/Re-bloquear piloto con la vestimenta actual.
+       * `[U]`: Desbloquear objetivo y retornar al modo libre.
+       * `[Clic]`: Selección directa por puntero sobre la pantalla.
 

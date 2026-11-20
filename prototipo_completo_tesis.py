@@ -792,6 +792,7 @@ class FlightController(threading.Thread):
 
 # ==============================================================================
 # 3. RASTREADOR DE PERSONA Y COMPENSADOR DE CONTRALUZ (CLAHE + MOBILENET-SSD)
+#    CON SISTEMA DE BLOQUEO DE OBJETIVO Y RE-IDENTIFICACIÓN POR TECLA (SEMI-AUTO)
 # ==============================================================================
 class RobustTargetTracker:
     def __init__(self, fov_horizontal=88.0):
@@ -800,6 +801,14 @@ class RobustTargetTracker:
         self.smooth_alpha = 0.65
         self.last_angle = 0.0
         self.last_seen_time = 0.0
+
+        # Sistema de Bloqueo de Objetivo y Re-Identificación (Semi-Automático por Tecla)
+        self.is_locked = False
+        self.pilot_hist = None
+        self.pilot_similarity = 0.0
+        self.last_raw_candidates = []
+        self.discarded_boxes = []
+        self.lock_status_msg = "MODO LIBRE: Parate al centro y pulsa 'B' para BLOQUEAR PILOTO"
 
         # Cargar MobileNet-SSD Caffe para detección robusta de cuerpo entero en cualquier postura
         self.net = None
@@ -827,42 +836,201 @@ class RobustTargetTracker:
             except Exception:
                 pass
 
+    def extract_torso_hist(self, frame, box):
+        """Extrae un histograma HSV tridimensional [8, 8, 8] del torso/vestimenta para Re-ID."""
+        h, w = frame.shape[:2]
+        bx1, by1, bx2, by2 = box
+        bw = bx2 - bx1
+        bh = by2 - by1
+        if bw < 10 or bh < 20:
+            return None
+        # Región del torso: 20% a 70% de altura, 20% a 80% de anchura
+        tx1 = max(0, min(w - 1, bx1 + int(bw * 0.20)))
+        tx2 = min(w, bx1 + int(bw * 0.80))
+        ty1 = max(0, min(h - 1, by1 + int(bh * 0.20)))
+        ty2 = min(h, by1 + int(bh * 0.70))
+        if tx2 <= tx1 + 4 or ty2 <= ty1 + 4:
+            return None
+        torso = frame[ty1:ty2, tx1:tx2]
+        hsv = cv2.cvtColor(torso, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1, 2], None, [8, 8, 8], [0, 180, 0, 256, 0, 256])
+        cv2.normalize(hist, hist, alpha=1.0, norm_type=cv2.NORM_L1)
+        return hist
+
+    def _compute_iou(self, boxA, boxB):
+        xA = max(boxA[0], boxB[0])
+        yA = max(boxA[1], boxB[1])
+        xB = min(boxA[2], boxB[2])
+        yB = min(boxA[3], boxB[3])
+        interArea = max(0, xB - xA) * max(0, yB - yA)
+        boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+        boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+        return interArea / float(max(1, boxAArea + boxBArea - interArea))
+
+    def lock_target(self, frame, target_box=None):
+        """Bloquea al piloto extrayendo su firma de vestimenta HSV."""
+        h, w = frame.shape[:2]
+        chosen_box = None
+        if target_box is not None:
+            chosen_box = target_box
+        elif self.last_raw_candidates:
+            # Seleccionar al candidato más centrado horizontalmente en la cámara
+            chosen = min(self.last_raw_candidates, key=lambda c: abs((c['box'][0] + c['box'][2])/2.0 - w/2.0))
+            chosen_box = chosen['box']
+        elif self.last_box is not None:
+            chosen_box = self.last_box
+
+        if chosen_box is None:
+            self.lock_status_msg = "AVISO: No se detecto persona en encuadre para bloquear."
+            return False, self.lock_status_msg
+
+        hist = self.extract_torso_hist(frame, chosen_box)
+        if hist is None:
+            self.lock_status_msg = "AVISO: Tamano insuficiente de recuadro para registrar firma."
+            return False, self.lock_status_msg
+
+        self.pilot_hist = hist
+        self.is_locked = True
+        self.last_box = chosen_box
+        self.last_seen_time = time.time()
+        self.pilot_similarity = 1.0
+        self.lock_status_msg = f"PILOTO BLOQUEADO (Lock Activo) | Pulsa 'B' re-bloquear, 'U' liberar"
+        return True, f"🔒 ¡PILOTO BLOQUEADO CON ÉXITO! Recuadro: {chosen_box}. Firma HSV guardada."
+
+    def lock_at_point(self, frame, click_x, click_y):
+        """Permite bloquear al objetivo haciendo clic directo con el mouse en la ventana."""
+        matched_box = None
+        for cand in self.last_raw_candidates:
+            bx1, by1, bx2, by2 = cand['box']
+            if bx1 <= click_x <= bx2 and by1 <= click_y <= by2:
+                matched_box = (bx1, by1, bx2, by2)
+                break
+        if matched_box is None and self.last_raw_candidates:
+            matched_box = min(self.last_raw_candidates,
+                              key=lambda c: np.hypot((c['box'][0]+c['box'][2])/2.0 - click_x,
+                                                     (c['box'][1]+c['box'][3])/2.0 - click_y))['box']
+        if matched_box is not None:
+            return self.lock_target(frame, matched_box)
+        return False, "No se encontró ningún humano cerca del punto seleccionado con el ratón."
+
+    def unlock_target(self):
+        """Libera el bloqueo y regresa al modo de detección libre."""
+        self.is_locked = False
+        self.pilot_hist = None
+        self.pilot_similarity = 0.0
+        self.discarded_boxes = []
+        self.lock_status_msg = "MODO LIBRE: Parate al centro y pulsa 'B' para BLOQUEAR PILOTO"
+        return True, "🔓 Objetivo liberado. Modo de detección libre activo."
+
     def detect(self, frame):
         h, w = frame.shape[:2]
-        best_box = None
-        confidence = 0.0
+        raw_candidates = []
 
         if self.net is not None:
             # Detección profunda de cuerpo completo (clase 15 = Persona en Pascal VOC)
             blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 0.007843, (300, 300), 127.5)
             self.net.setInput(blob)
             detections = self.net.forward()
-            max_conf = 0.0
             for i in range(detections.shape[2]):
                 conf = float(detections[0, 0, i, 2])
                 cls_id = int(detections[0, 0, i, 1])
-                if cls_id == 15 and conf > 0.35:
-                    if conf > max_conf:
-                        max_conf = conf
-                        box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-                        bx1, by1, bx2, by2 = box.astype(int)
-                        bx1 = max(0, min(w - 1, bx1))
-                        by1 = max(0, min(h - 1, by1))
-                        bx2 = max(0, min(w - 1, bx2))
-                        by2 = max(0, min(h - 1, by2))
-                        if bx2 > bx1 and by2 > by1:
-                            best_box = (bx1, by1, bx2, by2)
-                            confidence = conf
+                if cls_id == 15 and conf > 0.32:
+                    box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+                    bx1, by1, bx2, by2 = box.astype(int)
+                    bx1 = max(0, min(w - 1, bx1))
+                    by1 = max(0, min(h - 1, by1))
+                    bx2 = max(0, min(w - 1, bx2))
+                    by2 = max(0, min(h - 1, by2))
+                    if (bx2 - bx1) >= 12 and (by2 - by1) >= 24:
+                        raw_candidates.append({'box': (bx1, by1, bx2, by2), 'conf': conf})
         else:
             if self.cascade is not None:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 gray_eq = self.clahe.apply(gray)
                 faces = self.cascade.detectMultiScale(gray_eq, scaleFactor=1.15, minNeighbors=4, minSize=(40, 40))
-                if len(faces) > 0:
-                    fx, fy, fw, fh = max(faces, key=lambda b: b[2] * b[3])
-                    best_box = (max(0, fx - int(fw*0.2)), max(0, fy - int(fh*0.2)),
-                                min(w, fx + int(fw*1.4)), min(h, fy + int(fh*2.8)))
-                    confidence = 0.85
+                for (fx, fy, fw, fh) in faces:
+                    fb = (max(0, fx - int(fw*0.2)), max(0, fy - int(fh*0.2)),
+                          min(w, fx + int(fw*1.4)), min(h, fy + int(fh*2.8)))
+                    raw_candidates.append({'box': fb, 'conf': 0.85})
+
+        self.last_raw_candidates = raw_candidates
+        best_box = None
+        confidence = 0.0
+
+        if not self.is_locked:
+            # ==================================================================
+            # MODO LIBRE: Seleccionar al humano más centrado y visible
+            # ==================================================================
+            self.discarded_boxes = []
+            self.pilot_similarity = 0.0
+            if raw_candidates:
+                chosen = min(raw_candidates, key=lambda c: abs((c['box'][0] + c['box'][2])/2.0 - w/2.0))
+                best_box = chosen['box']
+                confidence = chosen['conf']
+        else:
+            # ==================================================================
+            # MODO BLOQUEADO (RE-ID): Filtrar gigantografías y falsos humanos
+            # ==================================================================
+            best_pilot = None
+            best_score = -1.0
+            best_sim = 0.0
+            best_hist = None
+            discarded = []
+
+            for cand in raw_candidates:
+                c_box = cand['box']
+                c_conf = cand['conf']
+                c_hist = self.extract_torso_hist(frame, c_box)
+
+                if c_hist is not None and self.pilot_hist is not None:
+                    bhatt = cv2.compareHist(self.pilot_hist, c_hist, cv2.HISTCMP_BHATTACHARYYA)
+                    sim_color = max(0.0, 1.0 - float(bhatt))
+                else:
+                    sim_color = 0.0
+
+                # Continuidad espacial (IoU y cercanía de centroides con el último encuadre del piloto)
+                if self.last_box is not None:
+                    iou = self._compute_iou(c_box, self.last_box)
+                    cx = (c_box[0] + c_box[2]) / 2.0
+                    cy = (c_box[1] + c_box[3]) / 2.0
+                    last_cx = (self.last_box[0] + self.last_box[2]) / 2.0
+                    last_cy = (self.last_box[1] + self.last_box[3]) / 2.0
+                    d_norm = np.hypot(cx - last_cx, cy - last_cy) / float(w)
+                    spatial_prox = max(0.0, 1.0 - d_norm * 2.2)
+                    spatial_score = max(iou, spatial_prox)
+                else:
+                    spatial_score = 0.50
+
+                # Puntuación combinada (60% apariencia de vestimenta, 40% proximidad espacial)
+                match_score = 0.60 * sim_color + 0.40 * spatial_score
+
+                # Criterio de discriminación estricto:
+                # El póster/gigantografía en pared tiene sim_color < 0.20 y score < 0.25.
+                # El piloto real mantiene sim_color >= 0.32 y score >= 0.36.
+                if sim_color >= 0.32 and match_score >= 0.36:
+                    if match_score > best_score:
+                        best_score = match_score
+                        best_pilot = cand
+                        best_sim = sim_color
+                        best_hist = c_hist
+                else:
+                    discarded.append({'box': c_box, 'conf': c_conf, 'sim': sim_color,
+                                      'reason': f"Falso Objetivo/Gigantografia ({sim_color*100:.0f}%)"})
+
+            self.discarded_boxes = discarded
+
+            if best_pilot is not None:
+                best_box = best_pilot['box']
+                confidence = best_pilot['conf']
+                self.pilot_similarity = best_sim
+                # Adaptación lenta de la firma de vestimenta para tolerar cambios de sombra
+                if best_sim > 0.60 and best_hist is not None:
+                    self.pilot_hist = 0.92 * self.pilot_hist + 0.08 * best_hist
+                    cv2.normalize(self.pilot_hist, self.pilot_hist, alpha=1.0, norm_type=cv2.NORM_L1)
+            else:
+                best_box = None
+                confidence = 0.0
+                self.pilot_similarity = 0.0
 
         if best_box is not None:
             if self.last_box is not None:
@@ -1055,6 +1223,13 @@ def main():
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win_name, 1280, 540)
 
+    # Callback de ratón para selección/bloqueo directo del piloto haciendo clic en la ventana
+    mouse_click_pos = [None]
+    def on_mouse_click(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            mouse_click_pos[0] = (x, y)
+    cv2.setMouseCallback(win_name, on_mouse_click)
+
     fps = 0.0
     latency_ms = 0.0
     frame_count = 0
@@ -1101,6 +1276,14 @@ def main():
     print(f"[*] Registrador de métricas de tesis activo:\n    -> {csv_file_path}\n")
 
     print("[OK] Demostración lista. Visualizador en pantalla activo.\n")
+    print("================================================================================")
+    print(" 🎯 SISTEMA DE PERSECUCIÓN CON BLOQUEO SEMI-AUTOMÁTICO DE PILOTO (ANTI-GIGANTOGRAFÍA)")
+    print(" --------------------------------------------------------------------------------")
+    print("  [B] / [K] / [P]   : BLOQUEAR al Piloto (guarda firma HSV y descarta gigantografías)")
+    print("  [Clic en Pantalla]: Bloqueo directo haciendo clic sobre el cuerpo del piloto")
+    print("  [U]               : DESBLOQUEAR objetivo y volver a modo de detección libre")
+    print("  [T] Despegue 1.5m | [L] Aterrizar | [O] Offboard | [Espacio] Parada de emergencia")
+    print("================================================================================\n")
 
     try:
         while True:
@@ -1190,6 +1373,16 @@ def main():
             dist_center = disp_to_meters(sec_center, is_center=True, narrow_arr=sec_narrow)
             dist_right  = disp_to_meters(sec_right)
             min_dist    = min(dist_left, dist_center, dist_right)
+
+            # Procesar clic de ratón si el usuario hizo clic en la ventana de video
+            if mouse_click_pos[0] is not None:
+                mx, my = mouse_click_pos[0]
+                mouse_click_pos[0] = None
+                if mx < wf and 45 <= my < 45 + hf:
+                    c_x = mx
+                    c_y = my - 45
+                    ok, msg = tracker.lock_at_point(frame_resized, c_x, c_y)
+                    print(f"\n[TARGET LOCK - CLIC] {msg}\n")
 
             # ------------------------------------------------------------------
             # PASO 2: Detección y Seguimiento del Objetivo Humano (MobileNet-SSD)
@@ -1570,16 +1763,51 @@ def main():
             cv2.drawMarker(left_view, (center_x, center_y), (0, 200, 255), cv2.MARKER_CROSS, 20, 2)
             cv2.circle(left_view, (center_x, center_y), 32, (0, 200, 255), 1)
 
-            # Si hay persona detectada, dibujar recuadro y línea de puntería
+            # 1. Dibujar falsos humanos o gigantografías descartadas (en rojo tenue / gris)
+            for disc in tracker.discarded_boxes:
+                dx1, dy1, dx2, dy2 = disc['box']
+                d_sim = disc.get('sim', 0.0)
+                cv2.rectangle(left_view, (dx1, dy1), (dx2, dy2), (80, 80, 180), 1)
+                lbl_disc = f"DESCARTADO (Gigantografia: {d_sim*100:.0f}%)"
+                (tw_d, th_d), _ = cv2.getTextSize(lbl_disc, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+                ly_d = max(th_d + 4, dy1 - 6)
+                cv2.rectangle(left_view, (dx1, ly_d - th_d - 2), (dx1 + tw_d + 4, ly_d + 2), (20, 20, 20), -1)
+                cv2.putText(left_view, lbl_disc, (dx1 + 2, ly_d),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (100, 100, 220), 1)
+
+            # 2. Dibujar objetivo válido / piloto
             if bbox is not None:
                 bx1, by1, bx2, by2 = bbox
-                cv2.rectangle(left_view, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
                 tgt_cx = (bx1 + bx2) // 2
                 tgt_cy = (by1 + by2) // 2
-                cv2.circle(left_view, (tgt_cx, tgt_cy), 5, (0, 255, 0), -1)
+                if tracker.is_locked:
+                    # PILOTO BLOQUEADO: Color Cian Neón (255, 255, 0) con esquinas tipo mira
+                    box_color = (255, 255, 0)
+                    sim_pct = int(tracker.pilot_similarity * 100)
+                    lbl_tgt = f"PILOTO [BLOQUEADO] ({sim_pct}% | D:{d_human_est:.2f}m)"
+                    cv2.rectangle(left_view, (bx1, by1), (bx2, by2), box_color, 2)
+                    corner_len = max(8, min(20, min((bx2-bx1)//4, (by2-by1)//4)))
+                    cv2.line(left_view, (bx1, by1), (bx1 + corner_len, by1), (0, 255, 255), 3)
+                    cv2.line(left_view, (bx1, by1), (bx1, by1 + corner_len), (0, 255, 255), 3)
+                    cv2.line(left_view, (bx2, by1), (bx2 - corner_len, by1), (0, 255, 255), 3)
+                    cv2.line(left_view, (bx2, by1), (bx2, by1 + corner_len), (0, 255, 255), 3)
+                    cv2.line(left_view, (bx1, by2), (bx1 + corner_len, by2), (0, 255, 255), 3)
+                    cv2.line(left_view, (bx1, by2), (bx1, by2 - corner_len), (0, 255, 255), 3)
+                    cv2.line(left_view, (bx2, by2), (bx2 - corner_len, by2), (0, 255, 255), 3)
+                    cv2.line(left_view, (bx2, by2), (bx2, by2 - corner_len), (0, 255, 255), 3)
+                else:
+                    # MODO LIBRE: Color Verde indicando tecla 'B'
+                    box_color = (0, 255, 0)
+                    lbl_tgt = f"Humano ({conf:.2f} | D:{d_human_est:.2f}m) [Pulsa 'B' para Bloquear]"
+                    cv2.rectangle(left_view, (bx1, by1), (bx2, by2), box_color, 2)
+
+                cv2.circle(left_view, (tgt_cx, tgt_cy), 5, box_color, -1)
                 cv2.line(left_view, (center_x, center_y), (tgt_cx, tgt_cy), (0, 255, 255), 2)
-                cv2.putText(left_view, f"Target: Humano ({conf:.2f} | D:{d_human_est:.2f}m)", (bx1, max(20, by1 - 8)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+                (tw, th), _ = cv2.getTextSize(lbl_tgt, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 2)
+                ly = max(th + 6, by1 - 8)
+                cv2.rectangle(left_view, (bx1, ly - th - 4), (bx1 + tw + 6, ly + 4), (0, 0, 0), -1)
+                cv2.putText(left_view, lbl_tgt, (bx1 + 3, ly),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.48, box_color, 2)
 
             # DIBUJAR RECUADRO AMARILLO DEL OBSTÁCULO DELGADO EN LA VISTA DE PERSECUCIÓN
             if thin_obs_info is not None:
@@ -1621,7 +1849,7 @@ def main():
                 cv2.putText(left_view, f"V: ({cmd_vx:+.2f}, {vis_vy:+.2f}) m/s", (arrow_end_x + 8, arrow_end_y),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 255), 2)
 
-            # Barra superior izquierda: Encabezado institucional y FPS
+            # Barra superior izquierda: Encabezado institucional, estado de Lock y FPS
             header_bar = np.zeros((45, wf, 3), dtype=np.uint8)
             header_bar[:] = (20, 20, 20)
             if not args.fly:
@@ -1634,10 +1862,19 @@ def main():
                 mode_tag = "[VUELO REAL - EN ESPERA (T / O)]"
                 tag_color = (0, 165, 255)
 
-            cv2.putText(header_bar, f"DJI AIR 2S {mode_tag}", (12, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, tag_color, 2)
-            cv2.putText(header_bar, f"FPS: {fps:.1f} | Lat: {latency_ms:.0f}ms", (wf - 185, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 2)
+            cv2.putText(header_bar, f"DJI AIR 2S {mode_tag}", (12, 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.46, tag_color, 2)
+            cv2.putText(header_bar, f"FPS: {fps:.1f} | Lat: {latency_ms:.0f}ms", (wf - 185, 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 255, 255), 1)
+
+            if tracker.is_locked:
+                lock_text = "🔒 PILOTO BLOQUEADO [ACTIVO] (Pulsa 'B': re-bloquear | 'U': liberar | Clic)"
+                lock_col = (255, 255, 0) # Cian
+            else:
+                lock_text = "🔓 MODO LIBRE: Parate al centro y pulsa 'B' para BLOQUEAR PILOTO"
+                lock_col = (0, 180, 255) # Naranja/Amarillo
+            cv2.putText(header_bar, lock_text, (12, 38),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, lock_col, 1)
             left_view = np.vstack((header_bar, left_view))
 
             # Barra inferior izquierda: Telemetría de vuelo y Altitud a 1.50m
@@ -1786,6 +2023,16 @@ def main():
             elif key == ord(' '):
                 # Pausa / Freno de emergencia en el aire
                 flight.toggle_emergency_hover()
+
+            elif key == ord('b') or key == ord('B') or key == ord('k') or key == ord('K') or key == ord('p') or key == ord('P'):
+                # Bloquear objetivo del Piloto actual (Semi-automático por tecla)
+                ok, msg = tracker.lock_target(frame_resized)
+                print(f"\n[TARGET LOCK - TECLADO] {msg}\n")
+
+            elif key == ord('u') or key == ord('U'):
+                # Desbloquear objetivo (Volver a modo libre)
+                ok, msg = tracker.unlock_target()
+                print(f"\n[TARGET LOCK - TECLADO] {msg}\n")
 
             elif key == ord('+') or key == ord('='):
                 flight.adjust_target_altitude(+0.10)

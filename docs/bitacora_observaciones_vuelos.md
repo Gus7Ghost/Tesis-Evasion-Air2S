@@ -288,3 +288,23 @@
      * Si el humano está a distancia lejana ($> 1.15\text{ m}$) sin un obstáculo inmediato a menos de $0.95\text{ m}$, el dron avanza de forma recta y estable sin realizar maniobras laterales espurias.
   4. **Suavizado de `disp_to_meters`:**
      * Se cambió del percentil 98.5 al percentil 92.0 con filtro Gaussiano $(5, 5)$, eliminando picos de ruido que generaban falsas lecturas de proximidad.
+
+
+## 12. Prueba 1 de Vuelo (20/11/2026): Validación de Estabilidad y Detección de Falso Humano en Gigantografía de Laboratorio
+* **Archivos de telemetría analizados:**
+  * `Air2S_MAVSDK/logs/metricas_vuelo_20261120_143859.csv` (3029 ciclos, duración total: $494.62\text{ s} \approx 8.24\text{ min}$).
+* **Resultados Positivos del Vuelo:**
+  1. **Excelente Estabilidad de Altitud:**
+     * Durante los 2150 ciclos con el dron en vuelo activo ($> 0.5\text{ m}$), la altitud media se mantuvo en $1.493\text{ m} \pm 0.166\text{ m}$, respetando el rango operativo seguro y alcanzando el tope de consigna fijado en $1.70\text{ m}$.
+     * La latencia media de ciclo fue de $133.5\text{ ms}$ ($\sim 6.14\text{ FPS}$), con ejecución simultánea en CPU del modelo MiDaS y MobileNet-SSD.
+  2. **Continuidad de Seguimiento Humano:**
+     * Se registraron 1854 ciclos con detección de objetivo humano positiva ($61.2\%$ de la sesión).
+     * Las maniobras de rotación sobre el eje (Yaw con ganancia $57.3$) mantuvieron el encuadre centrado sin oscilaciones parásitas.
+* **Problema Identificado en Campo:**
+  * En una de las paredes del laboratorio se encuentra colocada una **gigantografía/póster de gran tamaño de un científico**.
+  * Al ingresar en el campo de visión de la cámara, MobileNet-SSD clasifica la imagen del científico como clase 15 (`person`), debido a que su morfología 2D (cabeza, hombros y torso) satisface plenamente las características convolucionales aprendidas.
+  * Dado que el algoritmo seleccionaba el objetivo mediante el criterio de máxima confianza matemática (`conf > max_conf`), la gigantografía (al estar fija, nítida y perfectamente iluminada) generaba un puntaje de confianza superior al del piloto en movimiento, provocando que el dron desenganchara al piloto y se fijara en el póster.
+* **Plan de Acción para Re-Identificación Exclusiva del Piloto (Target Re-ID):**
+  * Se descarta la necesidad de entrenar un dataset masivo o pesado desde cero (ineficiente, dependiente del vestuario y de alto costo computacional).
+  * Se establece la implementación de una **Firma de Apariencia en Tiempo Real (HSV Color Signature)** combinada con **Enclavamiento Espacial de Continuidad (Target Lock por IoU/Centroide)** y **Filtro de Relieve MiDaS contra Superficie de Pared**, garantizando que el dron discrimine y persiga únicamente al piloto sin ser engañado por representaciones fotográficas 2D en paredes.
+

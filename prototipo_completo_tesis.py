@@ -395,9 +395,9 @@ class FlightController(threading.Thread):
         asyncio.create_task(self._telemetry_battery_task())
         asyncio.create_task(self._telemetry_flight_mode_task())
 
-        # Corrección Obs.3: Programar el gimbal a -15° de cabeceo (mirando ligeramente
-        # hacia abajo) para capturar mejor los obstáculos a nivel del suelo/banco.
-        asyncio.create_task(self._setup_gimbal_pitch())
+        # El gimbal se mantiene 100% en modo FPV/Follow de fábrica de DJI,
+        # sin enviar comandos MAVLink de gimbal que puedan desacoplar el yaw de la cámara.
+        # El operador puede ajustar el cabeceo manualmente con la ruedita del control remoto si lo desea.
 
         # Bucle de control de velocidad a 10 Hz (100 ms)
         while self.running:
@@ -1605,52 +1605,50 @@ def main():
 
                 else:
                     # ==============================================================
-                    # MODO 1.A: PERSECUCIÓN CONTINUA FLUIDA Y REGULACIÓN A 1.0 METRO
+                    # MODO 1.A: SEGUIMIENTO HUMANO DIRECTO Y REGULACIÓN A 1.0 METRO
                     # ==============================================================
-                    # 1.1 ALINEACIÓN ANGULAR CONTINUA Y ÁGIL (Curva de persecución suave):
-                    # El dron gira sobre su eje vertical proporcionalmente al error angular
-                    # sin frenar el avance longitudinal, produciendo un seguimiento continuo.
-                    if abs(target_angle) > 2.0:
-                        dir_s = 1.0 if target_angle > 0 else -1.0
-                        # Guiñada ágil y proporcional de 5.0°/s hasta 22.0°/s
-                        cmd_yaw_rate = float(dir_s * np.clip(5.0 + 0.65 * (abs(target_angle) - 2.0), 5.0, 22.0))
-                    else:
-                        cmd_yaw_rate = 0.0
-
-                    # 1.2 PIVOTE PURO DE SEGURIDAD SOLO SI EL OBJETIVO ESCAPA AL EXTREMO (> 22.0°):
-                    # Solo hace pausa longitudinal si el objetivo se desalineó más de 22°,
-                    # retornando a persecución continua al centrarse a <= 10.0°.
+                    # 1.1 GESTIÓN DE GIRO CON HISTÉRESIS (ac4ce96 calibrado):
+                    # Si estaba rotando en su propio eje, continúa hasta que el ángulo se reduzca a <= 4.0°.
+                    # Si estaba avanzando, solo conmuta a rotación pura si el ángulo supera los 14.0°.
                     if in_pure_pivot:
-                        if abs(target_angle) <= 10.0:
+                        if abs(target_angle) <= 4.0:
                             in_pure_pivot = False
                     else:
-                        if abs(target_angle) > 22.0:
+                        if abs(target_angle) > 14.0:
                             in_pure_pivot = True
 
                     if in_pure_pivot:
-                        # PIVOTE PURO EN EL EJE: recentrado rápido en el lugar
+                        # ROTACIÓN PURA EN EL EJE: Traslación en cero para orientar ágilmente hacia la persona
+                        dir_s = 1.0 if target_angle > 0 else -1.0
                         cmd_vx = 0.0
                         cmd_vy = 0.0
+                        cmd_yaw_rate = float(dir_s * np.clip(10.0 + 0.40 * (abs(target_angle) - 4.0), 10.0, 18.0))
                         dir_txt = "DERECHA" if target_angle > 0 else "IZQUIERDA"
                         fsm_state = f"ROTANDO_EN_EJE -> {dir_txt} ({target_angle:+.1f} deg | Yaw:{cmd_yaw_rate:+.0f})"
                         state_color = (0, 200, 255) # Amarillo/Cian
 
                     else:
-                        # PERSECUCIÓN CONTINUA: AVANCE / RETROCESO FLUIDO CON REGULACIÓN A 1.0 METRO
-                        # Factor de curvatura suave: modera levemente vx si el ángulo es grande, sin detenerse
-                        vx_factor = float(np.clip(1.0 - 0.35 * (abs(target_angle) / 22.0), 0.60, 1.0))
+                        # AVANCE / RETROCESO FLUIDO CON ALINEACIÓN CONTINUA
+                        # Guiñada ágil mientras avanza (hasta 14°/s) para mantener centrado al humano sin frenar
+                        if abs(target_angle) > 3.0:
+                            dir_s = 1.0 if target_angle > 0 else -1.0
+                            cmd_yaw_rate = float(dir_s * np.clip(5.0 + 0.50 * (abs(target_angle) - 3.0), 5.0, 14.0))
+                        else:
+                            cmd_yaw_rate = 0.0  # Perfectamente alineado
 
+                        # REGULACIÓN BIDIRECCIONAL DIRECTA DE DISTANCIA A 1.0 METRO:
                         if d_target > 1.25:
-                            # Humano a más de 1.25 m: avance continuo hacia el humano
-                            v_base = 0.28 if d_target > 1.70 else float(0.18 + (d_target - 1.25) * 0.22)
-                            cmd_vx = float(np.clip(v_base * vx_factor, 0.16, 0.30))
+                            # Humano lejos (> 1.25 m): avanzar directamente hacia él
+                            if d_target > 1.60:
+                                cmd_vx = 0.28
+                            else:
+                                cmd_vx = float(np.clip(0.18 + (d_target - 1.25) * 0.25, 0.18, 0.28))
                             cmd_vy = 0.0
                             fsm_state = f"AVANZANDO_HACIA_HUMANO ({d_target:.2f}m)"
                             state_color = (0, 255, 0) # Verde
 
                         elif d_target >= 0.90:
-                            # ZONA DE SEGURIDAD EXACTA DE 1.0 METRO (0.90m - 1.25m): HOVER ESTÁTICO
-                            # Mantiene posición frontal a 1.0m y rota en el eje si el humano se mueve a los lados
+                            # ZONA EXACTA DE 1.0 METRO (0.90m - 1.25m): HOVER ESTÁTICO PERFECTO
                             cmd_vx = 0.0
                             cmd_vy = 0.0
                             fsm_state = f"ENFOCANDO_A_1_METRO ({d_target:.2f}m)"
@@ -1659,15 +1657,14 @@ def main():
                         elif d_target >= 0.65:
                             # HUMANO ACERCÁNDOSE (< 0.90 m): RETROCESO ACTIVO INMEDIATO
                             # El dron retrocede activamente para restaurar la distancia segura de 1.0 m
-                            cmd_vx = -0.26
+                            cmd_vx = -0.25
                             cmd_vy = 0.0
                             fsm_state = f"RETROCESO_MANTENIENDO_1M ({d_target:.2f}m | Retroceso)"
                             state_color = (0, 200, 255) # Naranja advertencia
 
                         else:
                             # PROXIMIDAD CRÍTICA (< 0.65 m): RETROCESO RÁPIDO DE SEGURIDAD
-                            # El humano está muy cerca: retroceso decidido hacia atrás
-                            cmd_vx = -0.36
+                            cmd_vx = -0.35
                             cmd_vy = 0.0
                             fsm_state = f"RETROCESO_RAPIDO_SEGURIDAD ({d_target:.2f}m)"
                             state_color = (0, 0, 255) # Rojo peligro
@@ -1680,15 +1677,18 @@ def main():
                         else:
                             cmd_vy = 0.0
 
-            # SI NO HAY BBOX PERO UN HUMANO FUE VISTO HACE MENOS DE 2.5 SEGUNDOS:
-            elif time_since_human < 2.5 and (dist_center < 1.15 or d_human_est < 1.15):
-                # El humano está muy cerca y llenó el encuadre (pérdida momentánea de cuerpo entero):
-                # ¡NO ESQUIVAR LATERALMENTE NI AVANZAR! Retroceder decididamente para abrir distancia.
-                cmd_vx = -0.26
+            # SI NO HAY BBOX PERO UN HUMANO FUE VISTO HACE MENOS DE 1.5 SEGUNDOS:
+            elif time_since_human < 1.5:
+                # Pérdida momentánea (1-2 frames): Hover estable en el lugar sin retrocesos espurios
+                cmd_vx = 0.0
                 cmd_vy = 0.0
-                cmd_yaw_rate = 0.0
-                fsm_state = f"RETROCESO_PROXIMIDAD_HUMANO ({min(dist_center, d_human_est):.2f}m)"
-                state_color = (0, 140, 255) # Naranja
+                if abs(target_angle) > 3.0:
+                    dir_s = 1.0 if target_angle > 0 else -1.0
+                    cmd_yaw_rate = float(dir_s * 8.0)
+                else:
+                    cmd_yaw_rate = 0.0
+                fsm_state = "HOVER_ESPERA_REENGANCHE"
+                state_color = (0, 200, 255)
 
             elif min_dist < CRITICAL_HALT:
                 # ==============================================================

@@ -394,3 +394,24 @@
        * $0.90\text{ m} \le d_{\text{target}} \le 1.25\text{ m}$: Hover estático a 1.0 metro con orientación continua sobre el eje.
        * $0.65\text{ m} \le d_{\text{target}} < 0.90\text{ m}$: Retroceso activo inmediato ($v_x = -0.26\text{ m/s}$).
        * $d_{\text{target}} < 0.65\text{ m}$: Retroceso rápido de seguridad ($v_x = -0.36\text{ m/s}$).
+
+
+## 16. Corrección de Desacople de Guiñada del Gimbal y Eliminación de Oscilación de Avance/Retroceso (20/11/2026)
+* **Reporte del Operador en Vuelo:**
+  * *"Está peor... el dron se eleva y gira el cuerpo del dron y no la cámara del dron y luego también gira la cámara del dron... pero no se mueve el dron."*
+* **Diagnóstico de Telemetría Real (`metricas_vuelo_20261120_161952.csv`, 221 ciclos):**
+  1. **Causa del Giro Desfasado de la Cámara respecto al Cuerpo:**
+     * La tarea en segundo plano `_setup_gimbal_pitch()` enviaba periódicamente `set_pitch_and_yaw(-15.0, 0.0)`. Al inyectar un ángulo de `yaw = 0.0`, el gimbal del Air 2S se desacoplaba del modo FPV/Follow y bloqueaba su orientación angular hacia el Norte magnético. Por ende, el dron rotaba su chasis para apuntar al humano mientras la cámara se quedaba quieta mirando al frente. Cuando el ángulo del cuerpo excedía los límites mecánicos del gimbal ($\sim 24^\circ$), este daba un tirón brusco para recentrarse.
+  2. **Causa de la Falta de Movimiento del Dron ($v_x \approx 0.02\text{ m/s}$):**
+     * En cada caída natural de un único fotograma de la red neuronal (`bbox is None`), la variable `d_human_est` se inicializaba a `0.0`.
+     * La condición de emergencia evaluaba `0.0 < 1.15` como verdadero y enviaba inmediatamente retroceso (`cmd_vx = -0.26 m/s`). Al siguiente fotograma, el detector enganchaba al humano y ordenaba avance (`cmd_vx = +0.22 m/s`).
+     * Esta alternancia continua cada 200 ms ($+0.22 \leftrightarrow -0.26\text{ m/s}$) cancelaba por inercia cualquier desplazamiento físico, manteniendo al dron clavado en el aire.
+* **Soluciones Implementadas:**
+  1. **Eliminación Total de Comandos de Gimbal por MAVSDK:**
+     * Se canceló la tarea `_setup_gimbal_pitch()`. El gimbal del DJI Air 2S permanece 100% en su modo natural de fábrica FPV/Follow, garantizando que la cámara rote instantánea y solidariamente con el fuselaje del dron.
+  2. **Eliminación del Falso Retroceso en Fotogramas Perdidos:**
+     * Si el objetivo se pierde por 1-2 fotogramas, el dron no retrocede; entra en `HOVER_ESPERA_REENGANCHE` estático ($v_x = 0.0, v_y = 0.0$) manteniendo la orientación, eliminando la vibración longitudinal.
+  3. **Restauración de Maniobras de Persecución Calibradas (`ac4ce96`):**
+     * Histéresis angular calibrada ($14.0^\circ \leftrightarrow 4.0^\circ$) para pivote puro.
+     * Guiñada ágil mientras avanza (hasta $14.0^\circ/\text{s}$) para mantener centrado al humano sin necesidad de frenar el avance longitudinal.
+     * Avance directo ($v_x = 0.28\text{ m/s}$) y retroceso activo a 1.0 m ($v_x = -0.25\text{ m/s}$).

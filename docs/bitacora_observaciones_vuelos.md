@@ -353,3 +353,18 @@
      * Si el piloto sale de cuadro, el dron no avanza hacia las paredes ($v_x = 0.0$), sino que hace hover en el lugar y rota sobre su eje en la última dirección vista para re-engancharlo.
 
 
+
+## 14. Ajuste y Restauración de Maniobras de Persecución Fluidas (Histéresis ac4ce96) y Arquitectura de Objetivo Variado / Único (20/11/2026)
+* **Reporte del Operador en Vuelo:**
+  * Al probar el bloqueo de objetivo con el corte estricto a $6.0^\circ$, el dron avanzaba entrecortado, oscilando lentamente a izquierda y derecha, sin avanzar de forma directa ni mantener la distancia de seguridad con giros limpios sobre su eje vertical.
+* **Causa Raíz:**
+  * En vuelo real, el encuadre visual y el ángulo del objetivo fluctúan naturalmente entre $5^\circ$ y $9^\circ$ mientras el dron se desplaza hacia adelante. El umbral rígido $|target\_angle| > 6.0^\circ \implies v_x = 0.0$ introducido en el parche anterior provocaba un ciclado constante entre parada y arranque ($v_x = 0.26 \leftrightarrow 0.0\text{ m/s}$), traduciéndose en un avance lento, titubeante y con zig-zag.
+* **Soluciones Implementadas:**
+  1. **Restauración de las Maniobras de Persecución Comprobadas (`ac4ce96`):**
+     * **Histéresis Angular de Pivote Puro:** Se restituye el control por bandera `in_pure_pivot` con umbrales de histéresis calibrados: entra en pivote puro en el eje vertical si $|target\_angle| > 14.0^\circ$, y solo sale si $|target\_angle| < 4.0^\circ$.
+     * **Avance Fluido y Directo:** Mientras el ángulo sea $\le 14.0^\circ$ (y no esté en pivote puro), el dron avanza directamente hacia el objetivo a velocidad de crucero ($v_x = 0.26\text{ m/s}$) aplicando micro-ajustes proporcionales suaves de guiñada ($3.5^\circ/\text{s} \dots 7.5^\circ/\text{s}$), eliminando los frenazos y la lentitud lateral.
+     * **Control de Distancia Segura a 1.0 m:** Se mantiene el frenado preventivo en zona segura ($0.90\text{ m} \le d \le 1.25\text{ m}$) con velocidad nula ($v_x = 0.0$), y retroceso activo a $-0.24\text{ m/s}$ si el humano se aproxima a $< 0.90\text{ m}$.
+     * **Estimación Geométrica Robusta:** Se restituye $d_{\text{human\_est}} = \max(0.70, \min(4.50, 0.75 / \max(0.15, h_{\text{norm}})))$.
+  2. **Arquitectura Dual de Seguimiento (Objetivo Variado $\leftrightarrow$ Objetivo Único):**
+     * **Modo Objetivo Variado (Por defecto al iniciar):** El sistema rastrea al humano de mayor confianza (`conf > max_conf`), garantizando el comportamiento original comprobado en la Prueba 1 sin requerir configuración previa.
+     * **Modo Objetivo Único (Fijado por tecla `B`, `K`, `P` o Clic):** Al pulsar la tecla `B` o hacer clic en la pantalla, el dron bloquea la firma HSV del torso del piloto. A partir de ese instante discrimina y descarta activamente la gigantografía del científico u otros humanos presentes. Al pulsar `U`, se desbloquea y retorna al modo variado.

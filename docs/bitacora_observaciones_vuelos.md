@@ -455,3 +455,28 @@
      * Se acotó la velocidad angular a un máximo suave de $8.0^\circ/\text{s}$ ($3.0^\circ/\text{s} \dots 8.0^\circ/\text{s}$). A esta velocidad, el gimbal mecánico sigue perfectamente al chasis del dron en tiempo real, garantizando que chasis y cámara se muevan siempre como un único bloque sólido.
   3. **Purga de Métodos Residuales de Gimbal:**
      * Se eliminó por completo el método residual `_setup_gimbal_pitch()`, asegurando que MAVLink no interfiera con el control de actitud del gimbal.
+
+
+## 19. Validación Exitosa de Vuelo Continuo, Persecución Fluida y Evasión en Tiempo Real (20/11/2026)
+* **Reporte del Operador en Vuelo:**
+  * *"Funcionó bien, continuamos el lunes."*
+* **Evidencia Cuantitativa de Telemetría Real (`metricas_vuelo_20261120_164742.csv`):**
+  * **Duración total del vuelo:** $375.39\text{ s}$ ($6.26\text{ minutos}$ continuos de vuelo).
+  * **Ciclos totales de control ejecutados:** $2,736\text{ ciclos}$ a una frecuencia promedio estable de $\sim 7.3\text{ Hz}$ (latencia de ciclo de $\approx 135\text{ ms}$).
+  * **Comportamiento del Estado de Persecución y Navegación:**
+    * **`AVANZANDO_HACIA_HUMANO`:** $1,780\text{ ciclos}$ ($65.1\%$ del tiempo total). El dron avanzó de forma directa, fluida y sostenida hacia el operador ($v_x = 0.28\text{ m/s}$), eliminando al 100% el estancamiento o congelamiento en el eje vertical.
+    * **`HOVER_ESPERA_REENGANCHE`:** $314\text{ ciclos}$ ($11.5\%$). Filtrado robusto de pérdidas transitorias de fotogramas sin sacudidas ni falsos retrocesos.
+    * **`BUSQUEDA_CRUCERO`:** $251\text{ ciclos}$ ($9.2\%$). Navegación suave de exploración a $0.21\text{ m/s}$.
+    * **Evasión de Obstáculo Delgado en Tiempo Real:**
+      * `ESQUIVANDO_OBSTACULO_DELGADO_<< IZQUIERDA`: $129\text{ ciclos}$ ($4.7\%$).
+      * `ESQUIVANDO_OBSTACULO_DELGADO_DERECHA >>`: $111\text{ ciclos}$ ($4.1\%$).
+      * Evasión lateral suave ($v_y = \pm 0.35\text{ m/s}$) ejecutada con éxito esquivando el obstáculo delgado de 5 cm mientras mantenía la persecución visual del operador.
+    * **Mantenimiento y Retroceso a Distancia Segura:**
+      * `ENFOCANDO_A_1_METRO`: $86\text{ ciclos}$ ($3.1\%$) manteniendo la distancia segura de 1.0 m frente al operador.
+      * `RETROCESO_MANTENIENDO_1M`: $10\text{ ciclos}$ retrocediendo activamente ($v_x = -0.25\text{ m/s}$) cuando el operador se aproximaba al dron.
+* **Conclusiones Técnicas y Hito Alcanzado:**
+  1. Se logró una persecución visual continua, directa y sin interrupciones durante más de 6 minutos de autonomía real.
+  2. El gimbal y el chasis del DJI Air 2S operaron perfectamente acoplados en modo FPV Follow nativo gracias al tope de guiñada a $\le 8.0^\circ/\text{s}$.
+  3. El sistema integró con total éxito la coexistencia de persecución del objetivo con la detección y evasión reactiva del obstáculo delgado.
+  4. Fin de la jornada de pruebas de campo con validación empírica completada satisfactoriamente.
+

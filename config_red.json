@@ -1,8 +1,8 @@
 {
     "laptop_ip": "10.11.8.47",
-    "tablet_ip": "10.11.8.29",
+    "tablet_ip": "10.11.8.59",
     "mavlink_port": 19980,
     "video_port": 5600,
     "use_drone_video": true,
-    "real_flight": false
+    "real_flight": true
 }

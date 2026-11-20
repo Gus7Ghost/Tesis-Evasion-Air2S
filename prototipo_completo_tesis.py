@@ -64,7 +64,7 @@ def parse_arguments():
     parser.add_argument("--alt", type=float, default=1.70, help="Altitud objetivo de vuelo en metros (default: 1.70 m)")
     parser.add_argument("--speed", type=float, default=0.45, help="Velocidad segura de crucero y evasion en m/s (default: 0.45 m/s, estable y sin sobrevirajes)")
     parser.add_argument("--mavlink-port", type=int, default=19980, help="Puerto MAVLink UDP de RosettaDrone (default: 19980)")
-    parser.add_argument("--tablet-ip", type=str, default="10.11.8.29", help="IP de la tablet RosettaDrone (default: 10.11.8.29)")
+    parser.add_argument("--tablet-ip", type=str, default=None, help="IP de la tablet RosettaDrone (por defecto usa la última IP guardada)")
     parser.add_argument("--yaw-gain", type=float, default=57.3, help="Ganancia compensatoria de escala angular deg/rad para el puente RosettaDrone (default: 57.3)")
     parser.add_argument("--model", type=str, default="Air2S_MAVSDK/models/midas_v21_small_256.tflite", help="Ruta al modelo MiDaS")
     parser.add_argument("--invert-vy", action="store_true", default=False, help="Invertir signo lateral si el marco de referencia lo requiere (default: False)")
@@ -896,22 +896,33 @@ def main():
     # Pantalla interactiva para verificar/modificar IPs de Tablet y Laptop
     if not args.no_gui:
         try:
-            from interfaz_config_red import get_network_config_interactive
+            from interfaz_config_red import get_network_config_interactive, save_network_config
             net_cfg = get_network_config_interactive(current_args=args)
             if net_cfg is None:
                 print("\n[Operación cancelada por el usuario en la pantalla de configuración].")
                 return
-            args.tablet_ip = net_cfg.get("tablet_ip", args.tablet_ip)
+            args.tablet_ip = net_cfg.get("tablet_ip")
             local_ip = net_cfg.get("laptop_ip", get_local_ip(args.tablet_ip))
             if "use_drone_video" in net_cfg:
                 args.drone = net_cfg["use_drone_video"]
             if "real_flight" in net_cfg:
                 args.fly = net_cfg["real_flight"]
+            save_network_config(net_cfg)
         except Exception as e:
             print(f"[Aviso] Pantalla de configuración no disponible ({e}). Continuando...")
-            local_ip = get_local_ip(args.tablet_ip)
+            from interfaz_config_red import load_network_config, save_network_config
+            saved = load_network_config()
+            args.tablet_ip = args.tablet_ip or saved.get("tablet_ip", "10.11.8.59")
+            local_ip = saved.get("laptop_ip", get_local_ip(args.tablet_ip))
     else:
-        local_ip = get_local_ip(args.tablet_ip)
+        from interfaz_config_red import load_network_config, save_network_config
+        saved = load_network_config()
+        if args.tablet_ip is None:
+            args.tablet_ip = saved.get("tablet_ip", "10.11.8.59")
+        local_ip = saved.get("laptop_ip", get_local_ip(args.tablet_ip))
+        saved["tablet_ip"] = args.tablet_ip
+        saved["laptop_ip"] = local_ip
+        save_network_config(saved)
 
     tablet_ip_str = args.tablet_ip if args.tablet_ip else "Configurada en RosettaDrone"
 

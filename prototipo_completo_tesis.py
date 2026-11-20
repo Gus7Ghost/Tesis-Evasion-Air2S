@@ -280,6 +280,7 @@ class FreshFrameReader:
             self.cap = cv2.VideoCapture(src_uri, cv2.CAP_FFMPEG)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.latest_frame = None
+        self.last_frame_time = time.time()
         self.frame_counter = 0
         self.running = True
         self.lock = threading.Lock()
@@ -293,6 +294,7 @@ class FreshFrameReader:
                 if ret and frame is not None:
                     with self.lock:
                         self.latest_frame = frame
+                        self.last_frame_time = time.time()
                 else:
                     time.sleep(0.005)
             except Exception:
@@ -304,6 +306,9 @@ class FreshFrameReader:
     def read_latest(self):
         with self.lock:
             if self.latest_frame is None:
+                return False, None
+            # Watchdog de congelamiento: si no hay fotograma nuevo en más de 2.0s, alertar
+            if (time.time() - self.last_frame_time) > 2.0:
                 return False, None
             return True, self.latest_frame.copy()
 
@@ -1293,6 +1298,8 @@ def main():
             t_cycle_start = time.time()
             ret, frame = reader.read_latest()
             if not ret or frame is None:
+                # Video feed interrumpido o congelado: freno preventivo inmediato en el lugar
+                flight.set_nav_commands(0.0, 0.0, 0.0, "HOVER_VIDEO_DESCONECTADO")
                 key = read_key_input(20)
                 if key == ord('q') or key == 27:
                     print("\n[Salida solicitada por usuario]. Aterrizando con seguridad...")
@@ -1605,36 +1612,36 @@ def main():
 
                 else:
                     # ==============================================================
-                    # MODO 1.A: SEGUIMIENTO HUMANO DIRECTO Y REGULACIÓN A 1.0 METRO
+                    # MODO 1.A: PERSECUCIÓN DIRECTA EN LÍNEA RECTA Y REGULACIÓN A 1.0M
                     # ==============================================================
-                    # 1.1 GESTIÓN DE GIRO CON HISTÉRESIS (ac4ce96 calibrado):
-                    # Si estaba rotando en su propio eje, continúa hasta que el ángulo se reduzca a <= 4.0°.
-                    # Si estaba avanzando, solo conmuta a rotación pura si el ángulo supera los 14.0°.
+                    # 1.1 FILTRO DE PIVOTE PURO (Exclusivo para objetivo fuera de encuadre > 25°):
+                    # En vuelo normal (|angle| <= 25°), el dron avanza DIRECTO y continuo hacia el humano.
+                    # Ya NO se detiene a girar en su eje cada 2 segundos.
                     if in_pure_pivot:
-                        if abs(target_angle) <= 4.0:
+                        if abs(target_angle) <= 8.0:
                             in_pure_pivot = False
                     else:
-                        if abs(target_angle) > 14.0:
+                        if abs(target_angle) > 25.0:
                             in_pure_pivot = True
 
                     if in_pure_pivot:
-                        # ROTACIÓN PURA EN EL EJE: Traslación en cero para orientar ágilmente hacia la persona
+                        # PIVOTE PURO DE EMERGENCIA (solo si el objetivo se escapa a los bordes > 25°):
                         dir_s = 1.0 if target_angle > 0 else -1.0
                         cmd_vx = 0.0
                         cmd_vy = 0.0
-                        cmd_yaw_rate = float(dir_s * np.clip(10.0 + 0.40 * (abs(target_angle) - 4.0), 10.0, 18.0))
+                        cmd_yaw_rate = float(dir_s * np.clip(10.0 + 0.35 * (abs(target_angle) - 8.0), 10.0, 18.0))
                         dir_txt = "DERECHA" if target_angle > 0 else "IZQUIERDA"
                         fsm_state = f"ROTANDO_EN_EJE -> {dir_txt} ({target_angle:+.1f} deg | Yaw:{cmd_yaw_rate:+.0f})"
                         state_color = (0, 200, 255) # Amarillo/Cian
 
                     else:
-                        # AVANCE / RETROCESO FLUIDO CON ALINEACIÓN CONTINUA
-                        # Guiñada ágil mientras avanza (hasta 14°/s) para mantener centrado al humano sin frenar
-                        if abs(target_angle) > 3.0:
+                        # AVANCE DIRECTO EN LÍNEA RECTA CON CORRECCIÓN SUAVE DE CENTRADO:
+                        # Corrección de guiñada suave mientras avanza (sin frenazos ni tirones en el eje)
+                        if abs(target_angle) > 2.5:
                             dir_s = 1.0 if target_angle > 0 else -1.0
-                            cmd_yaw_rate = float(dir_s * np.clip(5.0 + 0.50 * (abs(target_angle) - 3.0), 5.0, 14.0))
+                            cmd_yaw_rate = float(dir_s * np.clip(3.5 + 0.40 * (abs(target_angle) - 2.5), 3.5, 12.0))
                         else:
-                            cmd_yaw_rate = 0.0  # Perfectamente alineado
+                            cmd_yaw_rate = 0.0  # Perfectamente centrado: vuelo en línea recta pura
 
                         # REGULACIÓN BIDIRECCIONAL DIRECTA DE DISTANCIA A 1.0 METRO:
                         if d_target > 1.25:

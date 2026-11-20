@@ -415,3 +415,24 @@
      * Histéresis angular calibrada ($14.0^\circ \leftrightarrow 4.0^\circ$) para pivote puro.
      * Guiñada ágil mientras avanza (hasta $14.0^\circ/\text{s}$) para mantener centrado al humano sin necesidad de frenar el avance longitudinal.
      * Avance directo ($v_x = 0.28\text{ m/s}$) y retroceso activo a 1.0 m ($v_x = -0.25\text{ m/s}$).
+
+
+## 17. Desbloqueo de Avance en Línea Recta (Supresión de Giro Intermitente en Eje) y Watchdog de Video Congelado (20/11/2026)
+* **Reporte del Operador en Vuelo:**
+  * *"Funcionó un poco mejor aunque cuando vino a perseguirme estaba parado justo al frente del dron pero él no vino en línea recta sino que vino girando de tanto en tanto en su eje... luego la imagen se congeló y apareció: [Salida solicitada por usuario]. Aterrizando con seguridad..."*
+* **Diagnóstico de Telemetría Real (`metricas_vuelo_20261120_162822.csv`, 1045 ciclos, duración: $228.58\text{ s}$):**
+  1. **Causa del Giro Intermitente en el Eje en vez de Línea Recta:**
+     * Durante el avance hacia el piloto, el ángulo visual fluctuaba naturalmente entre $5^\circ$ y $14.5^\circ$.
+     * Cada vez que el ángulo tocaba los $14.0^\circ$, el algoritmo entraba en `in_pure_pivot = True`, anulaba de golpe el avance frontal ($v_x = 0.0\text{ m/s}$) y pasaba $\sim 2.0\text{ s}$ girando en el lugar hasta centrarte a $\le 4.0^\circ$. Luego avanzaba 1 segundo, volvía a tocar $14^\circ$ y volvía a frenar para girar.
+     * Esto provocó 10 paradas completas de avance en vuelo, haciendo que el dron no avanzara en una línea recta continua.
+  2. **Causa del Congelamiento de Video tras ~4 Minutos:**
+     * A los 225 segundos de vuelo (batería al 60%), la tablet Android suspendió el flujo de paquetes UDP (típico auto-bloqueo/suspensión de pantalla en tablets tras varios minutos de inactividad táctil).
+     * `FreshFrameReader` no tenía temporizador de caducidad, por lo que continuó sirviendo el último fotograma congelado en bucle, hasta que el operador pulsó la tecla de salida (`q`) para aterrizar con seguridad.
+* **Soluciones Implementadas en `prototipo_completo_tesis.py`:**
+  1. **Avance Continuo en Línea Recta sin Detenciones:**
+     * Se amplió el umbral de pivote puro a $> 25.0^\circ$ (solo aplicable si el humano corre al borde extremo del encuadre).
+     * En todo el cono normal de visión ($\le 25.0^\circ$), el dron **AVANZA SIEMPRE DIRECTO HACIA TI ($v_x = 0.28\text{ m/s}$)** aplicando una corrección suave de guiñada ($3.5^\circ/\text{s} \dots 12.0^\circ/\text{s}$) para mantenerte centrado, sin detener nunca el avance hacia adelante.
+  2. **Watchdog de Detección de Video Congelado:**
+     * Se incorporó `last_frame_time` en `FreshFrameReader`. Si no ingresa un fotograma fresco por más de 2.0 segundos, el lector reporta pérdida de video y el dron pasa inmediatamente a **`HOVER_VIDEO_DESCONECTADO` estático en el lugar** ($v_x = 0, v_y = 0, \omega = 0$), protegiendo al dron de actuar sobre imágenes estáticas.
+  3. **Recomendación Operativa:**
+     * En la tablet Android, configurar la pantalla en "Tiempo de espera: Nunca" o "30 minutos" para impedir que Android entre en ahorro de energía y pause el streaming de video de RosettaDrone.

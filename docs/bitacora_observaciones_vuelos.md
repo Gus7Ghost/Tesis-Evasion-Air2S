@@ -368,3 +368,29 @@
   2. **Arquitectura Dual de Seguimiento (Objetivo Variado $\leftrightarrow$ Objetivo Único):**
      * **Modo Objetivo Variado (Por defecto al iniciar):** El sistema rastrea al humano de mayor confianza (`conf > max_conf`), garantizando el comportamiento original comprobado en la Prueba 1 sin requerir configuración previa.
      * **Modo Objetivo Único (Fijado por tecla `B`, `K`, `P` o Clic):** Al pulsar la tecla `B` o hacer clic en la pantalla, el dron bloquea la firma HSV del torso del piloto. A partir de ese instante discrimina y descarta activamente la gigantografía del científico u otros humanos presentes. Al pulsar `U`, se desbloquea y retorna al modo variado.
+
+
+## 15. Desacople Visual-Cinemático de Persecución Continua en Curva y Fusión Métrica Localizada de Proximidad Humana ($d_{\text{target}}$) (20/11/2026)
+* **Reporte del Operador en Vuelo:**
+  * *"Está mejor pero avanza un poquito y gira en su eje para centrarlo y otra vez avanza un poquito y gira en su eje... no es un movimiento de persecución continuo... y cuando me acerco mucho no retrocede para mantener su distancia."*
+* **Análisis de Métricas Experimentales Reales (`metricas_vuelo_20261120_160616.csv`, 888 ciclos):**
+  1. **Causa del Avance Intermitente (Stuttering de 77 transiciones en vuelo):**
+     * Al avanzar a $v_x = 0.28\text{ m/s}$, la disminución de distancia provocaba que el ángulo angular relativo del objetivo creciera geométricamente ($\theta = \arctan(\Delta x / d)$).
+     * La velocidad de guiñada durante el avance estaba topada en solo $7.5^\circ/\text{s}$, resultando insuficiente para recentrar al humano antes de cruzar los $14.0^\circ$.
+     * Cada vez que el ángulo tocaba $14.0^\circ$, `in_pure_pivot = True` cortaba la velocidad longitudinal a cero ($v_x = 0.0\text{ m/s}$), deteniendo el avance durante $\sim 2.0\text{ s}$ solo para girar en el lugar hasta $\le 4.0^\circ$. Al reanudar el avance, el ángulo volvía a superar $14.0^\circ$ en menos de $1.8\text{ s}$, ciclando indefinidamente entre avanzar y frenar para girar.
+  2. **Causa de la Falta de Retroceso al Acercarse el Operador:**
+     * El control de distancia en `MODO 1.A` leía `dist_center` (columna central del mapa de profundidad). Cuando el humano estaba ligeramente descentrado ($6^\circ \dots 12^\circ$), `dist_center` medía la pared de fondo ($2.1\text{ m} \dots 2.5\text{ m}$), impidiendo la activación del retroceso.
+     * Asimismo, la condición `elif dist_center < 0.75 and d_human_est > 1.05` clasificaba erróneamente el cuerpo cercano del operador como un obstáculo delgado intermedio (porque $h_{\text{norm}}$ se saturaba al cortarse las piernas en el encuadre), ordenando evasión lateral (`cmd_vy = -0.35 m/s`) en vez de un retroceso directo.
+* **Soluciones Implementadas en `prototipo_completo_tesis.py`:**
+  1. **Persecución Continua en Curva (Visual Servoing Fluido):**
+     * **Guiñada Proporcional Dinámica:** Ganancia ágil de $5.0^\circ/\text{s} \dots 22.0^\circ/\text{s}$ para mantener al objetivo centrado en todo momento.
+     * **Avance/Retroceso Simultáneo con Guiñada ($|target\_angle| \le 22.0^\circ$):** El dron no anula la velocidad longitudinal; avanza o retrocede **simultáneamente mientras gira sobre su eje vertical**, produciendo una trayectoria de persecución continua, suave y natural.
+     * **Pivote Puro Exclusivo de Emergencia ($|target\_angle| > 22.0^\circ$):** Solo se anula el avance si el objetivo está en el borde extremo de la cámara a punto de salirse del encuadre, saliendo del pivote al centrarse a $\le 10.0^\circ$.
+  2. **Estimación Métrica Localizada de Proximidad Humana ($d_{\text{target}}$):**
+     * Fusión del percentil 85 de disparidad MiDaS en el núcleo del torso humano con el ancho de hombros geométrico ($w_{\text{norm}}$), el cual permanece visible y preciso incluso a corta distancia ($d < 0.90\text{ m}$).
+     * Se eliminó la condición errónea que interpretaba el torso del operador como un obstáculo delgado intermedio.
+     * **Regulación Bidireccional a 1.0 Metro:**
+       * $d_{\text{target}} > 1.25\text{ m}$: Avance continuo hacia el objetivo.
+       * $0.90\text{ m} \le d_{\text{target}} \le 1.25\text{ m}$: Hover estático a 1.0 metro con orientación continua sobre el eje.
+       * $0.65\text{ m} \le d_{\text{target}} < 0.90\text{ m}$: Retroceso activo inmediato ($v_x = -0.26\text{ m/s}$).
+       * $d_{\text{target}} < 0.65\text{ m}$: Retroceso rápido de seguridad ($v_x = -0.36\text{ m/s}$).
